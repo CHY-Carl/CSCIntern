@@ -7,6 +7,7 @@ from PricingLib.PricingEngines.MC_Engine import MonteCarloEngine
 from PricingLib.PricingEngines.FDM_Engine import FDMEngine
 from PricingLib.Base.BaseLayer import MarketEnvironment
 from PricingLib.Base.Utils import RandomContext
+from PricingLib.Processes.GBM import GeometricBrownianMotion
 
 import xlwings as xw
 import numpy as np
@@ -29,10 +30,11 @@ def run_series_option(sheet):
     # 这里直接传入 K 数组！
     opt_call = EuropeanOption(K_arr, T, 'call')
     opt_put  = EuropeanOption(K_arr, T, 'put')
+    gbm_process = GeometricBrownianMotion()
 
     bs_engine = AnalyticBSEngine()
-    mc_engine = MonteCarloEngine(n_sims=M_mc, rng_type='sobol')
-    fdm_engine = FDMEngine(M_space=M_fdm, N_time=N_fdm)
+    mc_engine = MonteCarloEngine(process=gbm_process, n_sims=M_mc, rng_type='sobol')
+    fdm_engine = FDMEngine(process=gbm_process, M_space=M_fdm, N_time=N_fdm)
 
     # --- 3. 批量计算 (核心逻辑) ---
     

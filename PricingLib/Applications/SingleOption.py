@@ -7,6 +7,7 @@ from PricingLib.PricingEngines.MC_Engine import MonteCarloEngine
 from PricingLib.PricingEngines.FDM_Engine import FDMEngine
 from PricingLib.Base.BaseLayer import MarketEnvironment
 from PricingLib.Base.Utils import RandomContext
+from PricingLib.Processes.GBM import GeometricBrownianMotion
 
 import random
 
@@ -22,10 +23,12 @@ def run_single_option(sheet):
     opt_call = EuropeanOption(K, T, 'call')
     opt_put  = EuropeanOption(K, T, 'put')
 
+    gbm_process = GeometricBrownianMotion()
+
     # --- 3. 构建引擎 ---
     bs_engine = AnalyticBSEngine()
-    mc_engine = MonteCarloEngine(n_sims=M_mc, rng_type='sobol') 
-    fdm_engine = FDMEngine(M_space=M_fdm, N_time=N_fdm)
+    mc_engine = MonteCarloEngine(process=gbm_process, n_sims=M_mc, rng_type='sobol') 
+    fdm_engine = FDMEngine(process=gbm_process, M_space=M_fdm, N_time=N_fdm)
 
     # --- 4. 执行计算 (一键获取 Price + Greeks) ---
     

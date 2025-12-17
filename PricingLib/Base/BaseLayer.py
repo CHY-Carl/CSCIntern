@@ -200,3 +200,52 @@ class PricingEngine(ABC):
         # 注意: 这里的 2 * dVol 是因为我们做了 Sigma 的中心差分
         # 如果我们想要 per 1% 单位，且 dVol=0.01，则除以 2 即可
         return (delta_up_vol - delta_dn_vol) / 2
+
+
+
+# ==========================================================
+# ======= 7. Stochastic Process (随机过程) =================
+# ==========================================================
+class StochasticProcess(ABC):
+    """
+    随机过程的抽象基类 (无状态版)。
+    它是一个纯粹的数学公式集，不存储任何市场数据。
+    """
+    @abstractmethod
+    def drift(self, market: MarketEnvironment, t: float, S: np.ndarray) -> np.ndarray:
+        """返回 SDE 中的漂移项: mu(S,t) * S"""
+        pass
+        
+    @abstractmethod
+    def diffusion(self, market: MarketEnvironment, t: float, S: np.ndarray) -> np.ndarray:
+        """返回 SDE 中的扩散项: sigma(S,t) * S"""
+        pass    
+    
+    @abstractmethod
+    def diffusion_prime(self, market: MarketEnvironment, t: float, S: np.ndarray) -> np.ndarray:
+        """返回扩散项对 S 的一阶导数: d(diffusion)/dS"""
+        pass
+
+    @abstractmethod
+    def pde_coefficients(self, market: MarketEnvironment, t: float, S_vec: np.ndarray) -> tuple:
+        """返回 PDE 系数 (mu, sigma_sq, rate)"""
+        pass
+
+    def euler_step(self, market: MarketEnvironment, t: float, S: np.ndarray, dt: float, dW: np.ndarray) -> np.ndarray:
+        """提供一个默认的 Euler 离散化步进逻辑"""
+        return S + self.drift(market, t, S) * dt + self.diffusion(market, t, S) * dW
+
+    def milstein_step(self, market: MarketEnvironment, t: float, S: np.ndarray, dt: float, dW: np.ndarray) -> np.ndarray:
+        """提供一个默认的 Milstein 离散化步进逻辑"""
+        g = self.diffusion(market, t, S)
+        g_prime = self.diffusion_prime(market, t, S)
+        correction_term = 0.5 * g * g_prime * (dW**2 - dt)
+        
+        return self.euler_step(market, t, S, dt, dW) + correction_term
+
+    def generate_full_paths(self, S0: float, market: MarketEnvironment, n_steps: int, Z: np.ndarray) -> np.ndarray:
+        """
+        [可选] 提供一个高效的、一次性生成完整路径的向量化方法。
+        如果子类不实现，将返回 None，迫使 MCEngine 使用迭代法。
+        """
+        return None

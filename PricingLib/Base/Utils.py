@@ -95,7 +95,7 @@ class RandomNumberGenerator(ABC):
         pass
 
 class StandardRNG(RandomNumberGenerator):
-    """标准伪随机数生成器 (支持对偶变量 & 固定种子)"""
+    """标准伪随机数生成器"""
     def __init__(self, use_antithetic=True):
         self.use_antithetic = use_antithetic
         

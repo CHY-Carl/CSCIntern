@@ -6,6 +6,7 @@ from ..PricingEngines.BS_Engine import AnalyticBSEngine
 from ..PricingEngines.MC_Engine import MonteCarloEngine
 from ..PricingEngines.FDM_Engine import FDMEngine
 from ..Base.Utils import RandomContext
+from ..Processes.GBM import GeometricBrownianMotion
 
 def run_up_and_out_call_option(sheet):
     """
@@ -27,14 +28,15 @@ def run_up_and_out_call_option(sheet):
 
     # 2. 构建积木
     market = MarketEnvironment(S, r, sigma, T)
-    
+    gbm_process = GeometricBrownianMotion()
+
     # 构建鲨鱼鳍产品
     shark_fin = UpAndOutCall(K=K, H=H, T=T, rebate=rebate)
 
     # 3. 构建引擎
     bs_engine = AnalyticBSEngine()
-    mc_engine = MonteCarloEngine(n_sims=M_mc, n_steps=N_fdm, rng_type='sobol') 
-    fdm_engine = FDMEngine(M_space=M_fdm, N_time=N_fdm)
+    mc_engine = MonteCarloEngine(process=gbm_process, n_sims=M_mc, n_steps=N_fdm, rng_type='sobol') 
+    fdm_engine = FDMEngine(process=gbm_process, M_space=M_fdm, N_time=N_fdm)
 
     # 4. 计算 Price & Greeks
     def get_data(engine, option):

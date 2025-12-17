@@ -1,6 +1,6 @@
 import sys
 sys.path.append('../../')
-from PricingLib.Base.BaseLayer import PricingEngine, Instrument, MarketEnvironment
+from PricingLib.Base.BaseLayer import PricingEngine, Instrument, MarketEnvironment, StochasticProcess
 from PricingLib.Base.Utils import MathUtils, MatrixUtils
 
 
@@ -13,52 +13,77 @@ from typing import Dict, Any
 class FDMCoefficients(ABC):
     """策略接口：只负责计算矩阵系数 a, b, c"""
     @abstractmethod
-    def get_coefficients(self, dt, sigma, r, j_vec):
+    def get_coefficients(self, process: StochasticProcess, dt: float, dS: float, S_vec: np.ndarray):
         """返回 LHS(左边) 和 RHS(右边) 的系数"""
         pass
 
 class CNScheme(FDMCoefficients):
-    def get_coefficients(self, dt, sigma, r, j):
-        a = 0.25 * dt * (sigma**2 * j**2 - r * j)
-        b = -0.5 * dt * (sigma**2 * j**2 + r)
-        c = 0.25 * dt * (sigma**2 * j**2 + r * j)
+    """
+    通用的 Crank-Nicolson 有限差分格式。
+    """
+    def get_coefficients(self, 
+                         process: StochasticProcess, 
+                         market: MarketEnvironment, 
+                         dt: float, 
+                         dS: float, 
+                         S_vec: np.ndarray) -> tuple[tuple, tuple]:
+        """
+        根据通用的 PDE 系数计算 Crank-Nicolson 格式的系数向量。
         
-        # LHS: 1-b, -c, -a
-        lhs_coeffs = (-a, 1 - b, -c) # lower, diag, upper
-        # RHS: 1+b, c, a
-        rhs_coeffs = (a, 1 + b, c)   # lower, diag, upper
-        return lhs_coeffs, rhs_coeffs
+        求解的 PDE 形式: 
+        ∂V/∂t + α(S,t) * ∂²V/∂S² + β(S,t) * ∂V/∂S + γ(S,t) * V = 0
+        
+        Args:
+            process: 提供了 PDE 系数的随机过程对象。
+            market: 包含了市场参数的对象。
+            dt: 时间步长。
+            dS: 资产价格步长。
+            S_vec: 完整的资产价格网格向量。
+            
+        Returns:
+            一个元组，包含两个子元组：
+            ((l_lhs, d_lhs, u_lhs), (l_rhs, d_rhs, u_rhs))
+            分别代表 LHS 和 RHS 矩阵的三对角线系数。
+        """
+        # 1. 从 process 获取内部网格点上的通用 PDE 系数
+        inner_S_vec = S_vec[1:-1]
+        alpha_vec, beta_vec, gamma_vec = process.pde_coefficients(market, 0, inner_S_vec)
+        
+        # 2. 计算空间算子 L 离散化后的通用三对角系数 (a, b, c)
+        # LV_i ≈ a_i * V_{i-1} + b_i * V_i + c_i * V_{i+1}
+        
+        # 对应 V_{i-1} 的系数
+        a_vec = alpha_vec / dS**2 - beta_vec / (2 * dS)
+        
+        # 对应 V_{i} 的系数
+        b_vec = -2 * alpha_vec / dS**2 + gamma_vec
+        
+        # 对应 V_{i+1} 的系数
+        c_vec = alpha_vec / dS**2 + beta_vec / (2 * dS)
+        
+        # 3. 构建 Crank-Nicolson 格式的 LHS 和 RHS 系数
+        # 方程: (I - 0.5*dt*L)V_new = (I + 0.5*dt*L)V_old
+        
+        # LHS: (I - 0.5*dt*L) 的系数
+        l_lhs = -0.5 * dt * a_vec  # 下对角线
+        d_lhs = 1.0 - 0.5 * dt * b_vec  # 主对角线
+        u_lhs = -0.5 * dt * c_vec  # 上对角线
+        
+        # RHS: (I + 0.5*dt*L) 的系数
+        l_rhs = 0.5 * dt * a_vec   # 下对角线
+        d_rhs = 1.0 + 0.5 * dt * b_vec   # 主对角线
+        u_rhs = 0.5 * dt * c_vec   # 上对角线
+        
+        return (l_lhs, d_lhs, u_lhs), (l_rhs, d_rhs, u_rhs)
 
 class ImplicitScheme(FDMCoefficients):
-    """完全隐式法 (Fully Implicit)"""
-    def get_coefficients(self, dt, sigma, r, j):
-        # 隐式法: V_i = a V_{i-1} + b V_i + c V_{i+1} (at t) + V(t+1)
-        # 系数通常是:
-        a = 0.5 * dt * (r * j - sigma**2 * j**2)
-        b = 1 + dt * (sigma**2 * j**2 + r)
-        c = -0.5 * dt * (sigma**2 * j**2 + r * j)
-        
-        # LHS: b, a, c (注意符号约定，通常移项到左边)
-        # 修正标准形式: -a V_{j-1} + (1+...) V_j - c V_{j+1} = V_{next}
-        
-        alpha = 0.5 * dt * (sigma**2 * j**2 - r * j)
-        beta  = 0.5 * dt * (sigma**2 * j**2 + r * j)
-        
-        # LHS: -alpha, 1 + dt*sigma^2*j^2 + dt*r, -beta
-        lhs_lower = -alpha
-        lhs_diag  = 1 + dt * (sigma**2 * j**2 + r)
-        lhs_upper = -beta
-        
-        # RHS: Identity (只包含 V_next 本身)
-        rhs_lower = np.zeros_like(j, dtype=float)
-        rhs_diag  = np.ones_like(j, dtype=float)
-        rhs_upper = np.zeros_like(j, dtype=float)
-        
-        return (lhs_lower, lhs_diag, lhs_upper), (rhs_lower, rhs_diag, rhs_upper)
+    #TODO: 实现隐式格式
+    pass
 
 
 class FDMEngine(PricingEngine):
-    def __init__(self, M_space=100, N_time=100, std_mult=5.0, scheme_type='CN'):
+    def __init__(self, process: StochasticProcess, M_space=100, N_time=100, std_mult=5.0, scheme_type='CN'):
+        self.process = process
         self.M = int(M_space)
         self.N = int(N_time)
         self.std_mult = std_mult
@@ -70,6 +95,7 @@ class FDMEngine(PricingEngine):
         if hasattr(option, 'barrier'):
             S_max = option.barrier
         else:
+            #TODO: 其他SDE条件下的统计 S_max 计算
             log_S0 = np.log(S)
             drift = (r - 0.5 * sigma**2) * T
             vol_T = sigma * np.sqrt(T)
@@ -89,8 +115,8 @@ class FDMEngine(PricingEngine):
     def _solve_on_grid(self, option: Instrument, market: MarketEnvironment, S_vec: np.ndarray, dt: float):
         S, T, r, sigma = market.S, market.T, market.r, market.sigma
         
-        j = np.arange(1, self.M)
-        (l_lhs, d_lhs, u_lhs), (l_rhs, d_rhs, u_rhs) = self.scheme.get_coefficients(dt, sigma, r, j)
+        dS = S_vec[1] - S_vec[0]
+        (l_lhs, d_lhs, u_lhs), (l_rhs, d_rhs, u_rhs) = self.scheme.get_coefficients(self.process, market, dt, dS, S_vec)
         
         V = option.payoff(S_vec) 
         if V.ndim == 1: V = V[:, np.newaxis]
@@ -116,6 +142,7 @@ class FDMEngine(PricingEngine):
             
             # 求解
             V[1:-1, :] = MatrixUtils.solve_tridiagonal(u_lhs, d_lhs, l_lhs, rhs_vec)
+            # V[1:-1, :] = MatrixUtils.solve_tridiagonal(u_lhs[:-1], d_lhs, l_lhs[1:], rhs_vec)
             
         bc_l, bc_u = option.get_boundary_values(S_vec, 0, r)
         V[0, :] = bc_l; V[-1, :] = bc_u
