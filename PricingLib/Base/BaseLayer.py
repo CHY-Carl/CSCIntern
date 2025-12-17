@@ -1,0 +1,202 @@
+import numpy as np
+from dataclasses import dataclass
+from typing import Dict, Any, Union
+from abc import ABC, abstractmethod
+
+# ==========================================================
+# ======= 4. Market Environment (市场环境) =================
+# ==========================================================
+@dataclass
+class MarketEnvironment:
+    """
+    市场数据容器。
+    将 S, r, sigma 等打包，方便在 Engine 内部传递，
+    也便于 Greeks 计算时进行 clone 和 modify。
+    """
+    S: float          # Spot Price
+    r: float          # Risk-free Rate
+    sigma: float      # Volatility
+    T: float = 0.0    # Time to Maturity (计算时的剩余时间)
+    
+    def clone(self, **kwargs):
+        """
+        创建一个副本，并允许修改特定参数。
+        用于 Greeks 计算 (如 clone(S=S*1.01) )
+        """
+        # vars(self) 获取当前对象所有属性字典
+        new_args = vars(self).copy()
+        new_args.update(kwargs)
+        return MarketEnvironment(**new_args)
+
+# ==========================================================
+# ======= 5. Instrument (金融产品基类) =====================
+# ==========================================================
+class Instrument(ABC):
+    """
+    所有金融产品的父类。
+    它只定义合约条款 (Payoff)，不知道如何定价。
+    """
+    def __init__(self, T: float):
+        self.T = T
+        
+    @abstractmethod
+    def payoff(self, prices: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+        """
+        给定终值(或路径)，计算 Payoff。
+        必须支持向量化输入 (NumPy Broadcasting)。
+        """
+        pass
+
+    @abstractmethod
+    def is_path_dependent(self) -> bool:
+        """是否路径依赖 (决定 MC 是否需要存储完整路径)"""
+        pass
+
+    def get_boundary_values(self, S_vec, t_rem, r):
+        """
+        返回下边界和上边界的价值。
+        用于 FDM 边界条件处理。
+        返回: (lower_value, upper_value)
+        """
+        return 0.0, 0.0
+
+# ==========================================================
+# ======= 6. Pricing Engine (定价引擎基类) =================
+# ==========================================================
+class PricingEngine(ABC):
+    """
+    定价引擎父类。
+    定义统一的计算接口，并提供通用的数值 Greeks 计算逻辑。
+    """
+    
+    @abstractmethod
+    def calculate(self, option: Instrument, market: MarketEnvironment) -> Dict[str, Any]:
+        """
+        核心计算方法。
+        返回字典: {'price': float, 'greeks': dict, ...}
+        """
+        pass
+
+        # --- 公共接口 (Public Interface) ---
+    # 外部只调用这些方法，不关心内部是解析解还是数值解
+    
+    def get_price(self, option, market):
+        return self.calculate(option, market)['price']
+
+    def get_delta(self, option, market):
+        return self._calculate_numerical_delta(option, market)
+
+    def get_gamma(self, option, market):
+        return self._calculate_numerical_gamma(option, market)
+
+    def get_vega(self, option, market):
+        return self._calculate_numerical_vega(option, market)
+    
+    def get_theta(self, option, market):
+        return self._calculate_numerical_theta(option, market)
+    
+    def get_rho(self, option, market):
+        return self._calculate_numerical_rho(option, market)
+    
+    def get_vanna(self, option, market):
+        return self._calculate_numerical_vanna(option, market)
+    
+    def get_volga(self, option, market):
+        return self._calculate_numerical_volga(option, market)
+    
+
+
+    # --- 通用数值 Greeks 计算 (Template Method) ---
+    # 所有子类 Engine (MC, FDM) 都可以直接使用这些方法，无需重写
+    
+    def _calculate_numerical_delta(self, option, market):
+        dS = market.S * 0.01
+        m_up = market.clone(S=market.S + dS)
+        m_dn = market.clone(S=market.S - dS)
+        return (self.get_price(option, m_up) - self.get_price(option, m_dn)) / (2 * dS)
+
+    def _calculate_numerical_gamma(self, option, market):
+        dS = market.S * 0.01
+        m_up = market.clone(S=market.S + dS)
+        m_dn = market.clone(S=market.S - dS)
+        p_up = self.get_price(option, m_up)
+        p_mid = self.get_price(option, market)
+        p_dn = self.get_price(option, m_dn)
+        return (p_up - 2 * p_mid + p_dn) / (dS ** 2)
+
+    def _calculate_numerical_vega(self, option, market):
+        dVol = 0.01
+        m_up = market.clone(sigma=market.sigma + dVol)
+        m_dn = market.clone(sigma=market.sigma - dVol)
+        p_up = self.get_price(option, m_up)
+        p_dn = self.get_price(option, m_dn)
+        return (p_up - p_dn) / 2 # per 1% vol
+
+    def _calculate_numerical_theta(self, option, market):
+        dT = 1/365
+        # Time decay: T decreases
+        m_fut = market.clone(T=market.T - dT)
+        m_pst = market.clone(T=market.T + dT)
+        p_fut = self.get_price(option, m_fut)
+        p_pst = self.get_price(option, m_pst)
+        return (p_fut - p_pst) / 2
+
+    def _calculate_numerical_rho(self, option, market):
+        dR = 0.01
+        m_up = market.clone(r=market.r + dR)
+        m_dn = market.clone(r=market.r - dR)
+        p_up = self.get_price(option, m_up)
+        p_dn = self.get_price(option, m_dn)
+        return (p_up - p_dn) / 2
+
+    def _calculate_numerical_volga(self, option, market):
+        """
+        Volga = d2V / dSigma2
+        单位: Vega 变化 per 1% volatility
+        """
+        dVol = 0.01
+        m_up = market.clone(sigma=market.sigma + dVol)
+        m_dn = market.clone(sigma=market.sigma - dVol)
+        
+        p_up = self.get_price(option, m_up)
+        p_mid = self.get_price(option, market)
+        p_dn = self.get_price(option, m_dn)
+        
+        # 二阶中心差分
+        return (p_up - 2 * p_mid + p_dn) 
+
+    def _calculate_numerical_vanna(self, option, market):
+        """
+        Vanna = d2V / dS dSigma (Delta 对 Sigma 的敏感度)
+        单位: Delta 变化 per 1% volatility
+        算法: 交叉中心差分 (Finite Difference on Cross Derivatives)
+        """
+        dS = market.S * 0.01
+        dVol = 0.01
+        
+        # 我们需要在 (sigma + dVol) 和 (sigma - dVol) 两个平行宇宙里分别计算 Delta
+        
+        # 1. 宇宙 A: Sigma Up
+        m_up_vol = market.clone(sigma=market.sigma + dVol)
+        m_up_vol_up_S = m_up_vol.clone(S=m_up_vol.S + dS)
+        m_up_vol_dn_S = m_up_vol.clone(S=m_up_vol.S - dS)
+        
+        p_up_vol_up_S = self.get_price(option, m_up_vol_up_S)
+        p_up_vol_dn_S = self.get_price(option, m_up_vol_dn_S)
+        
+        delta_up_vol = (p_up_vol_up_S - p_up_vol_dn_S) / (2 * dS)
+        
+        # 2. 宇宙 B: Sigma Down
+        m_dn_vol = market.clone(sigma=market.sigma - dVol)
+        m_dn_vol_up_S = m_dn_vol.clone(S=m_dn_vol.S + dS)
+        m_dn_vol_dn_S = m_dn_vol.clone(S=m_dn_vol.S - dS)
+        
+        p_dn_vol_up_S = self.get_price(option, m_dn_vol_up_S)
+        p_dn_vol_dn_S = self.get_price(option, m_dn_vol_dn_S)
+        
+        delta_dn_vol = (p_dn_vol_up_S - p_dn_vol_dn_S) / (2 * dS)
+        
+        # 3. Vanna = (Delta_Up - Delta_Dn) / (2 * dVol)
+        # 注意: 这里的 2 * dVol 是因为我们做了 Sigma 的中心差分
+        # 如果我们想要 per 1% 单位，且 dVol=0.01，则除以 2 即可
+        return (delta_up_vol - delta_dn_vol) / 2
