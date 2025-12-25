@@ -38,6 +38,15 @@ class Instrument(ABC):
     """
     def __init__(self, T: float):
         self.T = T
+        self.is_active = True
+
+    def update_status(self, S: float) -> bool:
+        """更新存活状态。默认永远活着。"""
+        return self.is_active
+
+    def get_residual_value(self, S, T_rem, r):
+        """敲出后的残值 (Rebate PV)"""
+        return 0.0
         
     @abstractmethod
     def payoff(self, prices: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
@@ -70,7 +79,7 @@ class PricingEngine(ABC):
     """
     
     @abstractmethod
-    def calculate(self, option: Instrument, market: MarketEnvironment) -> Dict[str, Any]:
+    def calculate(self, option: Instrument, market: MarketEnvironment, **kwargs) -> Dict[str, Any]:
         """
         核心计算方法。
         返回字典: {'price': float, 'greeks': dict, ...}
@@ -80,76 +89,76 @@ class PricingEngine(ABC):
         # --- 公共接口 (Public Interface) ---
     # 外部只调用这些方法，不关心内部是解析解还是数值解
     
-    def get_price(self, option, market):
-        return self.calculate(option, market)['price']
+    def get_price(self, option, market, **kwargs):
+        return self.calculate(option, market, **kwargs)['price']
 
-    def get_delta(self, option, market):
-        return self._calculate_numerical_delta(option, market)
+    def get_delta(self, option, market, **kwargs):
+        return self._calculate_numerical_delta(option, market, **kwargs)
 
-    def get_gamma(self, option, market):
-        return self._calculate_numerical_gamma(option, market)
+    def get_gamma(self, option, market, **kwargs):
+        return self._calculate_numerical_gamma(option, market, **kwargs)
 
-    def get_vega(self, option, market):
-        return self._calculate_numerical_vega(option, market)
+    def get_vega(self, option, market, **kwargs):
+        return self._calculate_numerical_vega(option, market, **kwargs)
     
-    def get_theta(self, option, market):
-        return self._calculate_numerical_theta(option, market)
+    def get_theta(self, option, market, **kwargs):
+        return self._calculate_numerical_theta(option, market, **kwargs)
     
-    def get_rho(self, option, market):
-        return self._calculate_numerical_rho(option, market)
+    def get_rho(self, option, market, **kwargs):
+        return self._calculate_numerical_rho(option, market, **kwargs)
     
-    def get_vanna(self, option, market):
-        return self._calculate_numerical_vanna(option, market)
+    def get_vanna(self, option, market, **kwargs):
+        return self._calculate_numerical_vanna(option, market, **kwargs)
     
-    def get_volga(self, option, market):
-        return self._calculate_numerical_volga(option, market)
+    def get_volga(self, option, market, **kwargs):
+        return self._calculate_numerical_volga(option, market, **kwargs)
     
 
 
     # --- 通用数值 Greeks 计算 (Template Method) ---
     # 所有子类 Engine (MC, FDM) 都可以直接使用这些方法，无需重写
     
-    def _calculate_numerical_delta(self, option, market):
+    def _calculate_numerical_delta(self, option, market, **kwargs):
         dS = market.S * 0.01
         m_up = market.clone(S=market.S + dS)
         m_dn = market.clone(S=market.S - dS)
-        return (self.get_price(option, m_up) - self.get_price(option, m_dn)) / (2 * dS)
+        return (self.get_price(option, m_up, **kwargs) - self.get_price(option, m_dn, **kwargs)) / (2 * dS)
 
-    def _calculate_numerical_gamma(self, option, market):
+    def _calculate_numerical_gamma(self, option, market, **kwargs):
         dS = market.S * 0.01
         m_up = market.clone(S=market.S + dS)
         m_dn = market.clone(S=market.S - dS)
-        p_up = self.get_price(option, m_up)
-        p_mid = self.get_price(option, market)
-        p_dn = self.get_price(option, m_dn)
+        p_up = self.get_price(option, m_up, **kwargs)
+        p_mid = self.get_price(option, market, **kwargs)
+        p_dn = self.get_price(option, m_dn, **kwargs)
         return (p_up - 2 * p_mid + p_dn) / (dS ** 2)
 
-    def _calculate_numerical_vega(self, option, market):
+    def _calculate_numerical_vega(self, option, market, **kwargs):
         dVol = 0.01
         m_up = market.clone(sigma=market.sigma + dVol)
         m_dn = market.clone(sigma=market.sigma - dVol)
-        p_up = self.get_price(option, m_up)
-        p_dn = self.get_price(option, m_dn)
+        p_up = self.get_price(option, m_up, **kwargs)
+        p_dn = self.get_price(option, m_dn, **kwargs)
         return (p_up - p_dn) / 2 # per 1% vol
 
-    def _calculate_numerical_theta(self, option, market):
+    def _calculate_numerical_theta(self, option, market, **kwargs):
         dT = 1/365
         # Time decay: T decreases
         m_fut = market.clone(T=market.T - dT)
         m_pst = market.clone(T=market.T + dT)
-        p_fut = self.get_price(option, m_fut)
-        p_pst = self.get_price(option, m_pst)
+        p_fut = self.get_price(option, m_fut, **kwargs)
+        p_pst = self.get_price(option, m_pst, **kwargs)
         return (p_fut - p_pst) / 2
 
-    def _calculate_numerical_rho(self, option, market):
+    def _calculate_numerical_rho(self, option, market, **kwargs):
         dR = 0.01
         m_up = market.clone(r=market.r + dR)
         m_dn = market.clone(r=market.r - dR)
-        p_up = self.get_price(option, m_up)
-        p_dn = self.get_price(option, m_dn)
+        p_up = self.get_price(option, m_up, **kwargs)
+        p_dn = self.get_price(option, m_dn, **kwargs)
         return (p_up - p_dn) / 2
 
-    def _calculate_numerical_volga(self, option, market):
+    def _calculate_numerical_volga(self, option, market, **kwargs):
         """
         Volga = d2V / dSigma2
         单位: Vega 变化 per 1% volatility
@@ -158,14 +167,13 @@ class PricingEngine(ABC):
         m_up = market.clone(sigma=market.sigma + dVol)
         m_dn = market.clone(sigma=market.sigma - dVol)
         
-        p_up = self.get_price(option, m_up)
-        p_mid = self.get_price(option, market)
-        p_dn = self.get_price(option, m_dn)
+        p_up = self.get_price(option, m_up, **kwargs)
+        p_mid = self.get_price(option, market, **kwargs)
+        p_dn = self.get_price(option, m_dn, **kwargs)
         
-        # 二阶中心差分
         return (p_up - 2 * p_mid + p_dn) 
 
-    def _calculate_numerical_vanna(self, option, market):
+    def _calculate_numerical_vanna(self, option, market, **kwargs):
         """
         Vanna = d2V / dS dSigma (Delta 对 Sigma 的敏感度)
         单位: Delta 变化 per 1% volatility
@@ -181,8 +189,8 @@ class PricingEngine(ABC):
         m_up_vol_up_S = m_up_vol.clone(S=m_up_vol.S + dS)
         m_up_vol_dn_S = m_up_vol.clone(S=m_up_vol.S - dS)
         
-        p_up_vol_up_S = self.get_price(option, m_up_vol_up_S)
-        p_up_vol_dn_S = self.get_price(option, m_up_vol_dn_S)
+        p_up_vol_up_S = self.get_price(option, m_up_vol_up_S, **kwargs)
+        p_up_vol_dn_S = self.get_price(option, m_up_vol_dn_S, **kwargs)
         
         delta_up_vol = (p_up_vol_up_S - p_up_vol_dn_S) / (2 * dS)
         
@@ -191,8 +199,8 @@ class PricingEngine(ABC):
         m_dn_vol_up_S = m_dn_vol.clone(S=m_dn_vol.S + dS)
         m_dn_vol_dn_S = m_dn_vol.clone(S=m_dn_vol.S - dS)
         
-        p_dn_vol_up_S = self.get_price(option, m_dn_vol_up_S)
-        p_dn_vol_dn_S = self.get_price(option, m_dn_vol_dn_S)
+        p_dn_vol_up_S = self.get_price(option, m_dn_vol_up_S, **kwargs)
+        p_dn_vol_dn_S = self.get_price(option, m_dn_vol_dn_S, **kwargs)
         
         delta_dn_vol = (p_dn_vol_up_S - p_dn_vol_dn_S) / (2 * dS)
         
@@ -243,7 +251,7 @@ class StochasticProcess(ABC):
         
         return self.euler_step(market, t, S, dt, dW) + correction_term
 
-    def generate_full_paths(self, S0: float, market: MarketEnvironment, n_steps: int, Z: np.ndarray) -> np.ndarray:
+    def generate_full_paths(self, S0: float, market: MarketEnvironment, n_steps: int, Z: np.ndarray, **kwargs) -> np.ndarray:
         """
         [可选] 提供一个高效的、一次性生成完整路径的向量化方法。
         如果子类不实现，将返回 None，迫使 MCEngine 使用迭代法。

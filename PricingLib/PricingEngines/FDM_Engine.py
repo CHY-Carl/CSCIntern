@@ -77,8 +77,58 @@ class CNScheme(FDMCoefficients):
         return (l_lhs, d_lhs, u_lhs), (l_rhs, d_rhs, u_rhs)
 
 class ImplicitScheme(FDMCoefficients):
-    #TODO: 实现隐式格式
-    pass
+    """
+    完全隐式有限差分格式 (Fully Implicit / Backward Euler)。
+    特点：无条件稳定，具有单调性（不会产生 C-N 那样的数值振荡），
+    但精度为 O(dt + dS^2)，比 C-N 的 O(dt^2 + dS^2) 低。
+    """
+    def get_coefficients(self, 
+                         process: StochasticProcess, 
+                         market: MarketEnvironment, 
+                         dt: float, 
+                         dS: float, 
+                         S_vec: np.ndarray) -> tuple[tuple, tuple]:
+        
+        # 1. 从 process 获取内部网格点上的通用 PDE 系数
+        inner_S_vec = S_vec[1:-1]
+        alpha_vec, beta_vec, gamma_vec = process.pde_coefficients(market, 0, inner_S_vec)
+        
+        # 2. 计算空间算子 L 的通用三对角系数 (a, b, c)
+        # 这些系数与 C-N 中完全一致，代表 L 的离散化
+        
+        # 对应 V_{i-1}
+        a_vec = alpha_vec / dS**2 - beta_vec / (2 * dS)
+        
+        # 对应 V_{i}
+        b_vec = -2 * alpha_vec / dS**2 + gamma_vec
+        
+        # 对应 V_{i+1}
+        c_vec = alpha_vec / dS**2 + beta_vec / (2 * dS)
+        
+        # 3. 构建完全隐式格式的 LHS 和 RHS 系数
+        # 方程: (I - dt*L)V_new = V_old
+        
+        # LHS: (I - dt*L) 的系数
+        # 注意这里乘的是 1.0 * dt，而不是 0.5 * dt
+        l_lhs = -1.0 * dt * a_vec  # 下对角线
+        d_lhs = 1.0 - 1.0 * dt * b_vec  # 主对角线
+        u_lhs = -1.0 * dt * c_vec  # 上对角线
+        
+        # RHS: Identity (单位矩阵)
+        # V_new = ... * V_old
+        # 所以 RHS 对应的矩阵就是 I。
+        # 对角线为 1，上下对角线为 0。
+        
+        # 构造全 0 的上下对角线
+        zeros = np.zeros_like(a_vec)
+        # 构造全 1 的主对角线
+        ones = np.ones_like(b_vec)
+        
+        l_rhs = zeros
+        d_rhs = ones
+        u_rhs = zeros
+        
+        return (l_lhs, d_lhs, u_lhs), (l_rhs, d_rhs, u_rhs)
 
 
 class FDMEngine(PricingEngine):
@@ -93,8 +143,13 @@ class FDMEngine(PricingEngine):
         S, T, r, sigma = market.S, market.T, market.r, market.sigma
         
         if hasattr(option, 'barrier'):
+            S_min = 0.0
             S_max = option.barrier
+        elif hasattr(option, 'barrier_high') and hasattr(option, 'barrier_low'):
+            S_min = option.barrier_low
+            S_max = option.barrier_high
         else:
+            S_min = 0.0
             #TODO: 其他SDE条件下的统计 S_max 计算
             log_S0 = np.log(S)
             drift = (r - 0.5 * sigma**2) * T
@@ -106,7 +161,7 @@ class FDMEngine(PricingEngine):
                 K_val = np.max(option.K) if not np.isscalar(option.K) else option.K
             S_max = max(S_stat_max, K_val * 1.1)
             
-        S_vec = np.linspace(0, S_max, self.M + 1)
+        S_vec = np.linspace(S_min, S_max, self.M + 1)
         dt = T / self.N
     
         
@@ -142,59 +197,105 @@ class FDMEngine(PricingEngine):
             
             # 求解
             V[1:-1, :] = MatrixUtils.solve_tridiagonal(u_lhs, d_lhs, l_lhs, rhs_vec)
-            # V[1:-1, :] = MatrixUtils.solve_tridiagonal(u_lhs[:-1], d_lhs, l_lhs[1:], rhs_vec)
             
         bc_l, bc_u = option.get_boundary_values(S_vec, 0, r)
         V[0, :] = bc_l; V[-1, :] = bc_u
         return V
 
-    def calculate(self, option: Instrument, market: MarketEnvironment) -> Dict[str, Any]:
+    def calculate(self, option: Instrument, market: MarketEnvironment, **kwargs) -> Dict[str, Any]:
         S_vec, dt = self._generate_grid(option, market)
-
-        # # --- 抓鬼代码 ---
-        # print(f"!!! CRITICAL DEBUG !!!")
-        # print(f"Inputs: S={market.S}, K={option.K}, T={market.T}, r={market.r}, sigma={market.sigma}")
-        # print(f"Params: M={self.M}, N={self.N}, dt={dt}")
-        # print(f"Grid: S_max={S_vec[-1]}, len(S_vec)={len(S_vec)}")
-        # # ----------------
-
         V_final = self._solve_on_grid(option, market, S_vec, dt)
         price = MathUtils.linear_interp(market.S, S_vec, V_final)
+    
+        # 如果当前 S 已经在边界外，直接处理（安全保护）
+        #TODO 安全保护的向量期权情况处理逻辑
+        if market.S <= S_vec[0] or market.S >= S_vec[-1]:
+            bc_l, bc_u = option.get_boundary_values(S_vec, market.T, market.r)
+            price = bc_l if market.S <= S_vec[0] else bc_u
         
-        if np.isscalar(option.K):
+        if isinstance(price, np.ndarray) and price.size == 1:
+            price = price.item()
+        
+        if np.ndim(price) == 0:
             return {'price': float(price)}
         else:
             return {'price': price.flatten()}
 
-    # --- Greeks Overrides (Grid Locking) ---
-    # 确保这些方法都在类内部定义
     
-    def get_delta(self, option, market):
+    def get_delta(self, option, market, **kwargs):
         S_vec, dt = self._generate_grid(option, market)
+
+        if hasattr(option, 'barrier_high') and market.S >= option.barrier_high:
+            return 0.0
+        if hasattr(option, 'barrier_low') and market.S <= option.barrier_low:
+            return 0.0
+        if hasattr(option, 'barrier') and market.S >= option.barrier: 
+            return 0.0
+        
         V = self._solve_on_grid(option, market, S_vec, dt)
         dS_grid = S_vec[1] - S_vec[0]
         D_grid = np.gradient(V, dS_grid, axis=0, edge_order=2)
-        return MathUtils.linear_interp(market.S, S_vec, D_grid)
 
-    def get_gamma(self, option, market):
+        delta_val = MathUtils.linear_interp(market.S, S_vec, D_grid)
+
+        if isinstance(delta_val, np.ndarray) and delta_val.size == 1:
+            return delta_val.item() 
+        
+        return delta_val
+
+    def get_gamma(self, option, market, **kwargs):
         S_vec, dt = self._generate_grid(option, market)
+
+        if hasattr(option, 'barrier_high') and market.S >= option.barrier_high:
+            return 0.0
+        if hasattr(option, 'barrier_low') and market.S <= option.barrier_low:
+            return 0.0
+        if hasattr(option, 'barrier') and market.S >= option.barrier: 
+            return 0.0
+        
         V = self._solve_on_grid(option, market, S_vec, dt)
         dS_grid = S_vec[1] - S_vec[0]
         D_grid = np.gradient(V, dS_grid, axis=0, edge_order=2)
         G_grid = np.gradient(D_grid, dS_grid, axis=0, edge_order=2)
-        return MathUtils.linear_interp(market.S, S_vec, G_grid)
 
-    def get_vega(self, option, market):
+        Gamma_val = MathUtils.linear_interp(market.S, S_vec, G_grid)
+
+        if isinstance(Gamma_val, np.ndarray) and Gamma_val.size == 1:
+            return Gamma_val.item() 
+        
+        return Gamma_val
+
+    def get_vega(self, option, market, **kwargs):
         S_vec, dt = self._generate_grid(option, market)
+
+        if hasattr(option, 'barrier_high') and market.S >= option.barrier_high:
+            return 0.0
+        if hasattr(option, 'barrier_low') and market.S <= option.barrier_low:
+            return 0.0
+        if hasattr(option, 'barrier') and market.S >= option.barrier: 
+            return 0.0
+        
         dVol = 0.01
         m_up = market.clone(sigma=market.sigma + dVol)
         m_dn = market.clone(sigma=market.sigma - dVol)
         p_up = MathUtils.linear_interp(market.S, S_vec, self._solve_on_grid(option, m_up, S_vec, dt))
         p_dn = MathUtils.linear_interp(market.S, S_vec, self._solve_on_grid(option, m_dn, S_vec, dt))
-        return (p_up - p_dn) / 2
+        Vega_val = (p_up - p_dn) / 2
 
-    def get_theta(self, option, market):
+        if isinstance(Vega_val, np.ndarray) and Vega_val.size == 1:
+            return Vega_val.item()
+        return Vega_val
+
+    def get_theta(self, option, market, **kwargs):
         S_vec, dt = self._generate_grid(option, market)
+
+        if hasattr(option, 'barrier_high') and market.S >= option.barrier_high:
+            return 0.0
+        if hasattr(option, 'barrier_low') and market.S <= option.barrier_low:
+            return 0.0
+        if hasattr(option, 'barrier') and market.S >= option.barrier: 
+            return 0.0
+        
         dT = 1/365
         # 锁定 dt，只改变 T
         m_fut = market.clone(T=market.T - dT)
@@ -206,29 +307,69 @@ class FDMEngine(PricingEngine):
         
         p_fut = MathUtils.linear_interp(market.S, S_vec, self._solve_on_grid(option, m_fut, S_vec, dt_fut))
         p_pst = MathUtils.linear_interp(market.S, S_vec, self._solve_on_grid(option, m_pst, S_vec, dt_pst))
-        return (p_fut - p_pst) / 2
+        theta_val = (p_fut - p_pst) / 2
 
-    def get_rho(self, option, market):
+        if isinstance(theta_val, np.ndarray) and theta_val.size == 1:
+            return theta_val.item()
+        
+        return theta_val
+
+    def get_rho(self, option, market, **kwargs):
         S_vec, dt = self._generate_grid(option, market)
+
+        if hasattr(option, 'barrier_high') and market.S >= option.barrier_high:
+            return 0.0
+        if hasattr(option, 'barrier_low') and market.S <= option.barrier_low:
+            return 0.0
+        if hasattr(option, 'barrier') and market.S >= option.barrier: 
+            return 0.0
+        
         dR = 0.01
         m_up = market.clone(r=market.r + dR)
         m_dn = market.clone(r=market.r - dR)
         p_up = MathUtils.linear_interp(market.S, S_vec, self._solve_on_grid(option, m_up, S_vec, dt))
         p_dn = MathUtils.linear_interp(market.S, S_vec, self._solve_on_grid(option, m_dn, S_vec, dt))
-        return (p_up - p_dn) / 2
+        rho_val = (p_up - p_dn) / 2
 
-    def get_volga(self, option, market):
+        if isinstance(rho_val, np.ndarray) and rho_val.size == 1:
+            return rho_val.item()
+        
+        return rho_val
+
+
+    def get_volga(self, option, market, **kwargs):
         S_vec, dt = self._generate_grid(option, market)
+
+        if hasattr(option, 'barrier_high') and market.S >= option.barrier_high:
+            return 0.0
+        if hasattr(option, 'barrier_low') and market.S <= option.barrier_low:
+            return 0.0
+        if hasattr(option, 'barrier') and market.S >= option.barrier: 
+            return 0.0
+        
         dVol = 0.01
         m_up = market.clone(sigma=market.sigma + dVol)
         m_dn = market.clone(sigma=market.sigma - dVol)
         p_up = MathUtils.linear_interp(market.S, S_vec, self._solve_on_grid(option, m_up, S_vec, dt))
         p_mid = MathUtils.linear_interp(market.S, S_vec, self._solve_on_grid(option, market, S_vec, dt))
         p_dn = MathUtils.linear_interp(market.S, S_vec, self._solve_on_grid(option, m_dn, S_vec, dt))
-        return (p_up - 2 * p_mid + p_dn)
+        volga_val = (p_up - 2 * p_mid + p_dn)
 
-    def get_vanna(self, option, market):
+        if isinstance(volga_val, np.ndarray) and volga_val.size == 1:
+            return volga_val.item()
+        
+        return volga_val
+
+    def get_vanna(self, option, market, **kwargs):
         S_vec, dt = self._generate_grid(option, market)
+
+        if hasattr(option, 'barrier_high') and market.S >= option.barrier_high:
+            return 0.0
+        if hasattr(option, 'barrier_low') and market.S <= option.barrier_low:
+            return 0.0
+        if hasattr(option, 'barrier') and market.S >= option.barrier: 
+            return 0.0
+        
         dS_grid = S_vec[1] - S_vec[0]
         dVol = 0.01
         m_up = market.clone(sigma=market.sigma + dVol)
@@ -239,4 +380,9 @@ class FDMEngine(PricingEngine):
         D_dn = np.gradient(V_dn, dS_grid, axis=0, edge_order=2)
         d_up_val = MathUtils.linear_interp(market.S, S_vec, D_up)
         d_dn_val = MathUtils.linear_interp(market.S, S_vec, D_dn)
-        return (d_up_val - d_dn_val) / 2
+        vanna_val = (d_up_val - d_dn_val) / 2
+
+        if isinstance(vanna_val, np.ndarray) and vanna_val.size == 1:
+            return vanna_val.item()
+        
+        return vanna_val

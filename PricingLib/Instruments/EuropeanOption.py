@@ -9,7 +9,6 @@ class EuropeanOption(Instrument):
     def __init__(self, K: float, T: float, option_type: str = 'call'):
         super().__init__(T)
         self.K = K
-        # 统一转为小写，防止用户输入 'Call' 或 'CALL' 出错
         self.option_type = option_type.lower()
         
         if self.option_type not in ['call', 'put']:
@@ -33,7 +32,6 @@ class EuropeanOption(Instrument):
                 return np.maximum(self.K - prices, 0.0)
         
         # 复杂情况：K 是数组 (Series Option)，prices 是路径终值向量
-        # 我们需要利用 Broadcasting 生成矩阵
         # prices shape: (M,) -> (M, 1)
         # K shape: (N,) -> (1, N)
         # Result: (M, N)
@@ -48,7 +46,7 @@ class EuropeanOption(Instrument):
                 return np.maximum(self.K - prices_col, 0.0)
             
     def is_path_dependent(self) -> bool:
-        return False # 普通期权只看终值 S_T
+        return False 
     
     def get_boundary_values(self, S_vec, t_rem, r):
         # S_vec[0] is lower, S_vec[-1] is upper

@@ -6,7 +6,6 @@ from PricingLib.PricingEngines.BS_Engine import AnalyticBSEngine
 from PricingLib.PricingEngines.MC_Engine import MonteCarloEngine
 from PricingLib.PricingEngines.FDM_Engine import FDMEngine
 from PricingLib.Base.BaseLayer import MarketEnvironment
-from PricingLib.Base.Utils import RandomContext
 from PricingLib.Processes.GBM import GeometricBrownianMotion
 
 import xlwings as xw
@@ -27,7 +26,6 @@ def run_series_option(sheet):
 
     # --- 2. 构建对象 ---
     market = MarketEnvironment(S, r, sigma, T)
-    # 这里直接传入 K 数组！
     opt_call = EuropeanOption(K_arr, T, 'call')
     opt_put  = EuropeanOption(K_arr, T, 'put')
     gbm_process = GeometricBrownianMotion()
@@ -38,21 +36,19 @@ def run_series_option(sheet):
 
     # --- 3. 批量计算 (核心逻辑) ---
     
-    # 辅助：获取一系列结果
-    def get_results(eng, opt):
-        with RandomContext(seed=random.randint(0, 1000000)):
-            # 1. Price
-            price = eng.calculate(opt, market)['price'] # -> (N,)
-            # 2. Greeks
-            delta = eng.get_delta(opt, market)
-            gamma = eng.get_gamma(opt, market)
-            vega  = eng.get_vega(opt, market)
-            theta = eng.get_theta(opt, market)
-            rho   = eng.get_rho(opt, market)
-            vanna = eng.get_vanna(opt, market)
-            volga = eng.get_volga(opt, market)
-            
-            return price, delta, gamma, vega, theta, rho, vanna, volga
+    def get_results(eng, opt, market=market, seed=None):
+        if seed is None:
+            seed = random.randint(0, 1000000)
+        price = eng.calculate(opt, market)['price'] # -> (N,)
+        delta = eng.get_delta(opt, market, seed=seed)
+        gamma = eng.get_gamma(opt, market, seed=seed)
+        vega  = eng.get_vega(opt, market, seed=seed)
+        theta = eng.get_theta(opt, market, seed=seed)
+        rho   = eng.get_rho(opt, market, seed=seed)
+        vanna = eng.get_vanna(opt, market, seed=seed)
+        volga = eng.get_volga(opt, market, seed=seed)
+        
+        return price, delta, gamma, vega, theta, rho, vanna, volga
 
     # 执行计算
     # BS
@@ -64,8 +60,6 @@ def run_series_option(sheet):
     mc_p_res = get_results(mc_engine, opt_put)
     
     # FDM
-    # 注意：FDMEngine 目前的 calculate 实现对于 K 是数组的情况
-    # 会自动扩展 S_max 并返回向量，逻辑已经由 FDM 内部处理
     fdm_c_res = get_results(fdm_engine, opt_call)
     fdm_p_res = get_results(fdm_engine, opt_put)
 
@@ -77,9 +71,7 @@ def run_series_option(sheet):
         fdm_c_res[0], fdm_p_res[0]
     ))
     
-    # Greeks Columns: BS(8 cols), MC(8 cols), FDM(8 cols)
     # Order per method: Call Delta, Put Delta, Gamma, Vega, Vanna, Volga, Call Theta, Put Theta, Call Rho, Put Rho
-    # (根据你之前的 Excel 顺序调整)
     
     def stack_greeks(c_res, p_res):
         return np.column_stack((
