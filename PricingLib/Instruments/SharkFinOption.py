@@ -107,13 +107,50 @@ class DoubleSharkFin(Instrument):
     """
     def __init__(self, K_L: float, K_U: float, H_L: float, H_U: float, 
                  T: float, R_L: float = 0.0, R_U: float = 0.0):
-        super().__init__(T)
         self.K_L = K_L
         self.K_U = K_U
         self.H_L = H_L
         self.H_U = H_U
         self.R_L = R_L
         self.R_U = R_U
+        self.T_init = T
+        
+        # --- 状态管理属性 (供 Simulator 使用) ---
+        self.is_active = True
+        self.knock_out_type = None # 可以是 'UP', 'DOWN', 或者 None
+
+    def update_status(self, S: float) -> bool:
+        """
+        [供 Simulator 调用]
+        根据当前价格 S 检查并更新期权状态。
+        如果期权是存活的且当前价格触碰任一边界，则将其标记为“已敲出”。
+        返回期权是否依然存活。
+        """
+        if self.is_active:
+            if S >= self.H_U:
+                self.is_active = False
+                self.knock_out_type = 'UP'
+                # print(f"DEBUG: Product Knocked Out UP at {S:.2f} >= {self.H_U}")
+            elif S <= self.H_L:
+                self.is_active = False
+                self.knock_out_type = 'DOWN'
+                # print(f"DEBUG: Product Knocked Out DOWN at {S:.2f} <= {self.H_L}")
+        return self.is_active
+
+    def get_residual_value(self, S: float, T_rem: float, r: float) -> float:
+        """
+        [供 Simulator 调用]
+        计算期权的剩余盯市价值。
+        根据敲出的方向，返回对应返息的折现值。
+        """
+        if self.knock_out_type == 'UP':
+            return self.R_U * np.exp(-r * T_rem)
+        elif self.knock_out_type == 'DOWN':
+            return self.R_L * np.exp(-r * T_rem)
+        else:
+            # 如果从未被触发过，在到期前是没有残值的
+            return 0.0
+
 
     def is_path_dependent(self) -> bool:
         return True

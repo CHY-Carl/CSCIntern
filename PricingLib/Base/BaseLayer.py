@@ -1,32 +1,28 @@
 import numpy as np
 from dataclasses import dataclass
-from typing import Dict, Any, Union
+from typing import Dict, Any, Union, Callable, List
 from abc import ABC, abstractmethod
 
 # ==========================================================
 # ======= 4. Market Environment (市场环境) =================
 # ==========================================================
-@dataclass
+@dataclass(frozen=True)
 class MarketEnvironment:
     """
-    市场数据容器。
-    将 S, r, sigma 等打包，方便在 Engine 内部传递，
-    也便于 Greeks 计算时进行 clone 和 modify。
+    一个不可变的、可哈希的市场环境数据类。
+    `frozen=True` 会自动生成 __hash__ 和 __eq__ 方法。
     """
-    S: float          # Spot Price
-    r: float          # Risk-free Rate
-    sigma: float      # Volatility
-    T: float = 0.0    # Time to Maturity (计算时的剩余时间)
+    S: float
+    r: float
+    sigma: float
+    T: float
     
     def clone(self, **kwargs):
         """
-        创建一个副本，并允许修改特定参数。
-        用于 Greeks 计算 (如 clone(S=S*1.01) )
+        创建一个新的、修改了部分属性的市场环境实例。
         """
-        # vars(self) 获取当前对象所有属性字典
-        new_args = vars(self).copy()
-        new_args.update(kwargs)
-        return MarketEnvironment(**new_args)
+        from dataclasses import replace
+        return replace(self, **kwargs)
 
 # ==========================================================
 # ======= 5. Instrument (金融产品基类) =====================
@@ -68,6 +64,53 @@ class Instrument(ABC):
         返回: (lower_value, upper_value)
         """
         return 0.0, 0.0
+    
+        # --- [新增] FDM 离散事件接口 (虚方法) ---
+    
+    def get_event_dates(self, T_total: float) -> List[float]:
+        """
+        [虚方法] 如果产品有离散事件，子类应重写此方法。
+        返回所有事件发生的【剩余时间点】(T_rem)
+        默认实现返回一个空列表，表示没有离散事件。
+        Args:
+            T_total (float): 产品的总期限（年）。
+        Returns:
+            List[float]: 事件日期列表 (年化剩余时间)。
+        """
+        return []
+
+    def get_event_handler(self) -> Callable:
+        """
+        [虚方法] 如果产品有离散事件，子类应重写此方法。
+        返回一个事件处理器函数。此函数将在每个事件日被 EventFDMEngine 调用，
+        用于修正当前的价值向量。
+        Handler Function Signature:
+            handler(V_current: np.ndarray, S_vec: np.ndarray, t_event_rem: float) -> np.ndarray
+        默认实现返回一个“什么都不做”的函数，直接原样返回价值向量。
+        Returns:
+            Callable: 事件处理器函数。
+        """
+        return lambda V, S_vec, t_event_rem: V
+
+
+
+class ProductPortfolio:
+    """
+    一个简单的容器类，用于表示由多个金融工具组成的投资组合。
+    Engine 会识别这个类型，并对其组件分别进行定价，然后汇总结果。
+    """
+    def __init__(self, components: List[Instrument]):
+        if not components:
+            raise ValueError("Component list cannot be empty.")
+        self.components = components
+
+    def set_market_environment(self, market: MarketEnvironment):
+        """
+        将市场环境广播给所有需要它的子组件。
+        """
+        for comp in self.components:
+            if hasattr(comp, 'set_market_environment'):
+                comp.set_market_environment(market)
 
 # ==========================================================
 # ======= 6. Pricing Engine (定价引擎基类) =================

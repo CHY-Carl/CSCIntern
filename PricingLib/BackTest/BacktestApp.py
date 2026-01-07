@@ -74,6 +74,16 @@ def run_backtest_logic(market_data_df, config, strategy_type='delta_hedge', opti
             rebate=config['rebate'],
             T=1.0,
         )
+    elif option_type == 'DoubleSharkFin':
+        opt_product = DoubleSharkFin(
+            K_L=config['K_L'],
+            K_U=config['K_U'],
+            H_L=config['H_L'],
+            H_U=config['H_U'],
+            R_L=config['R_L'],
+            R_U=config['R_U'],
+            T=1.0,
+        )
 
     #TODO: 支持更多产品
     else:

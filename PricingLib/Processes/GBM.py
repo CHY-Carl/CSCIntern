@@ -1,6 +1,6 @@
 import numpy as np
 from ..Base.BaseLayer import StochasticProcess, MarketEnvironment
-
+#TODO  加入分红率q 
 class GeometricBrownianMotion(StochasticProcess):
     """
     SDE: dS = r*S*dt + sigma*S*dW

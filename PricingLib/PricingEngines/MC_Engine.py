@@ -94,7 +94,10 @@ class MonteCarloEngine(PricingEngine):
         S, T, r = market.S, market.T, market.r
         
         if T <= 0:
-            price = np.mean(option.payoff(S))
+            if not hasattr(option, 'process_one_path'):
+                price = np.mean(option.payoff(S))
+            else: # 对于雪球这类产品，到期 payoff 逻辑复杂，仍需模拟
+                price = self.price_at_expiry(option, market)
             return {'price': float(price) if np.ndim(price) == 0 else price.flatten()}
         # 1. 决定路径步数
         if self.path_gen_method == 'exact' and not option.is_path_dependent():
@@ -106,19 +109,41 @@ class MonteCarloEngine(PricingEngine):
         full_path = self._generate_paths(market, self.n_sims, n_steps_to_run)
         
         # 3. 计算 Payoff
-        if option.is_path_dependent():
+        if hasattr(option, 'process_one_path'): # 存在该方法则必然是路径依赖产品
+            # 逐条路径处理，计算支付和支付时间
+            payoffs = np.zeros(self.n_sims)
+            settlement_times = np.zeros(self.n_sims)
+        
+            for i in range(self.n_sims):
+                payoff, settlement_time = option.process_one_path(full_path[i, :])
+                payoffs[i] = payoff
+                settlement_times[i] = settlement_time
+            
+            # 进行差异化折现
+            discount_factors = np.exp(-r * settlement_times)
+            discounted_payoffs = payoffs * discount_factors
+            price = np.mean(discounted_payoffs)
+        elif option.is_path_dependent():
             payoffs = option.payoff(full_path)
+            price = np.mean(payoffs, axis=0) * np.exp(-r * T)
         else:
             payoffs = option.payoff(full_path[:, -1])
+            price = np.mean(payoffs, axis=0) * np.exp(-r * T)
             
-        # 4. 折现求均值
-        price = np.mean(payoffs, axis=0) * np.exp(-r * T)
-        
-        # 5. 格式化返回
+        # 4. 格式化返回
         if np.ndim(price) == 0:
             return {'price': float(price)}
         else:
             return {'price': price.flatten()}
+        
+    def price_at_expiry(self, option, market):
+        """
+        辅助方法：处理 T=0 时复杂产品的定价（通过模拟一步）
+        """
+        # 模拟一步，路径长度为2 (S0, S0)
+        path = np.array([market.S, market.S]) 
+        payoff, _ = option.process_one_path(path)
+        return payoff
     
     def get_price(self, option, market, **kwargs):
         self._active_seed = kwargs.get('seed', None)
