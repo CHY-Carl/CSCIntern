@@ -62,7 +62,7 @@ class DeltaHedgeStrategy(HedgingStrategy):
     """
     
     def __init__(self, engine: PricingEngine,
-                 num_options:float,
+                 notional_amount: float,
                  hedge_instrument: str = 'Future',
                  future_multiplier: int = 200, 
                  threshold: float = 0.0):
@@ -74,7 +74,7 @@ class DeltaHedgeStrategy(HedgingStrategy):
             threshold: 调仓阈值 (Delta变动超过此值才交易，节省手续费)
         """
         super().__init__(engine)
-        self.num_options = num_options
+        self.notional_amount = notional_amount
         self.hedge_instrument = hedge_instrument
         self.fut_mult = future_multiplier
         self.threshold = threshold
@@ -83,27 +83,26 @@ class DeltaHedgeStrategy(HedgingStrategy):
         self.last_target = 0.0 
 
     def calculate_target_position(self, option: Instrument, market: MarketEnvironment, **kwargs) -> tuple[float, dict]:
-        # 1. 调用 Engine 计算单位 Delta
-        delta_per_option = self.engine.get_delta(option, market, **kwargs)
-        
-        # 2. 计算期权端的总 Delta 敞口 (Total Delta Value)
-        total_shares_needed = delta_per_option * self.num_options
+        delta_pct = self.engine.get_delta(option, market, **kwargs)
 
-        # 3. 转换为对冲工具手数
-        if self.hedge_instrument == 'Future':
-            # 期货：除以合约乘数
-            target_pos = total_shares_needed / self.fut_mult
-        else:
-            # 现货：直接交易股数 (乘数为 1)
-            target_pos = total_shares_needed
+        current_real_spot = kwargs.get('current_real_spot')
+        if current_real_spot is None:
+            raise ValueError("DeltaHedgeStrategy requires 'current_real_spot' in kwargs to calculate position.")
+
+        required_hedge_value = delta_pct * self.notional_amount
+
+        target_shares = required_hedge_value / current_real_spot
         
-        # 4. 阈值过滤
+        if self.hedge_instrument == 'Future':
+            target_pos = target_shares / self.fut_mult
+        else:
+            target_pos = target_shares
+        
         if self.threshold > 0:
             change = abs(target_pos - self.last_target)
             if change < self.threshold:
-                return self.last_target
+                return self.last_target, {'delta': float(delta_pct)}
         
         self.last_target = target_pos
 
-        signals_to_log = {'delta': float(delta_per_option)}
-        return float(target_pos), signals_to_log
+        return float(target_pos), {'delta': float(delta_pct)}

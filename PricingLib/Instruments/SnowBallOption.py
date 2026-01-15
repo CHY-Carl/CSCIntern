@@ -128,6 +128,9 @@ class SnowballOption(Instrument):
             return final_payoff
         else:
             raise NotImplementedError("Use engine logic.")
+    
+    def get_critical_points(self) -> list:
+        return [self.B_out, self.B_in]
         
 
 class SmallSnowball(Instrument):
@@ -189,6 +192,9 @@ class SmallSnowball(Instrument):
             return final_payoff
         else:
             raise NotImplementedError("Use engine logic.")
+    
+    def get_critical_points(self) -> list:
+        return [self.B_out]
          
 
 
@@ -229,6 +235,9 @@ class KnockOutCouponComponent(Instrument):
     @property
     def ko_barrier(self) -> float:
         return self.B_out
+
+    def get_critical_points(self):
+        return [self.B_out]
         
     def is_path_dependent(self) -> bool:
         return True
@@ -390,6 +399,9 @@ class DoubleNoTouchComponent(Instrument):
     def ko_barrier(self) -> float:
         return self.B_out
 
+    def get_critical_points(self):
+        return [self.B_out, self.B_in]
+    
     def is_path_dependent(self) -> bool:
         return True
 
@@ -497,6 +509,9 @@ class KnockInPutComponent(Instrument):
     def ko_barrier(self):
         return self.B_out 
 
+    def get_critical_points(self):
+        return [self.B_out, self.B_in]
+    
     def is_path_dependent(self) -> bool:
         return True
 
@@ -585,6 +600,9 @@ class KnockInPutComponent(Instrument):
             def ko_barrier(self):
                 return self.B_out
 
+            def get_critical_points(self):
+                return [parent.B_out]
+            
             def get_event_dates(self, current_T):
                 return parent.get_event_dates(current_T) # 复用
 
@@ -751,7 +769,380 @@ class UnifiedSnowball(Instrument):
     def is_path_dependent(self) -> bool:
         return True
 
+    def get_critical_points(self):
+        return [self.B_out, self.B_in]
     
+
+
+
+class StepDownSnowball(Instrument):
+    """
+    [Step-down Snowball] 阶梯降敲雪球产品类
+    """
+    
+    def __init__(self, 
+                 initial_price: float, knock_in_barrier: float, obs_dates: List[int],          
+                 initial_ko_barrier: float, step_down_size: float, coupon_rate: float,
+                 rebate_rate: float, T_total: float,                
+                 dt: float, T_rem: float = None, has_knocked_in: bool = False,
+                 ko_floor: float = None):       
+        """
+        Args:
+            obs_dates: 观察月份列表 (整数)，例如 [3, 6, 9, 12]。
+            initial_ko_barrier: 第一个观察日(列表中的第一个月)的敲出价格。
+            step_down_size: 每次观察下调的数值。
+            dt: Monte Carlo 时间步长。
+        """
+        # 1. 基础参数
+        self.S0 = initial_price
+        self.B_in = knock_in_barrier
+        
+        self.C_annual = coupon_rate
+        self.R_annual = rebate_rate
+        self.T_total = T_total
+        self.dt = dt
+        self.N = 1.0
+        self.obs_dates = obs_dates
+        
+        self.T_rem = T_total if T_rem is None else T_rem
+        super().__init__(T=self.T_rem)
+        
+        self.has_knocked_in = has_knocked_in
+        
+        self.ko_barriers_full_schedule = []
+        
+        for i in range(len(obs_dates)):
+            current_barrier = initial_ko_barrier - (i * step_down_size)
+            
+            if ko_floor is not None:
+                current_barrier = max(current_barrier, ko_floor)
+            
+            self.ko_barriers_full_schedule.append(current_barrier)
+    
+        
+        current_time_elapsed = self.T_total - self.T_rem
+        
+        self.mc_ko_schedule = []    # MC: List of (step_idx, barrier)
+        self.fdm_event_map = {}     # FDM: Dict {t_rem : barrier}
+        self.maturity_barrier = float('inf') 
+        
+        epsilon = 1e-5 
+        
+        for month_idx, barrier in zip(obs_dates, self.ko_barriers_full_schedule):
+            date_in_years = month_idx / 12.0
+    
+            if abs(date_in_years - self.T_total) < epsilon:
+                self.maturity_barrier = barrier
+            
+            if date_in_years > current_time_elapsed + epsilon:
+                time_from_now = date_in_years - current_time_elapsed
+                step_idx = int(round(time_from_now / self.dt))
+                if step_idx > 0:
+                    self.mc_ko_schedule.append((step_idx, barrier))
+                
+                # FDM 处理 (使用剩余时间)
+                t_rem_at_event = self.T_total - date_in_years
+                self.fdm_event_map[round(t_rem_at_event, 6)] = barrier
+
+    
+    def is_path_dependent(self) -> bool:
+        return True
+
+    def process_one_path(self, price_path: np.ndarray) -> Tuple[float, float]:
+        for step_idx, barrier in self.mc_ko_schedule:
+            if step_idx < len(price_path):
+                if price_path[step_idx] >= barrier:
+                    settlement_time = step_idx * self.dt
+                    total_time = (self.T_total - self.T_rem) + settlement_time
+                    payoff = self.N * (1 + self.C_annual * total_time)
+                    return payoff, settlement_time
+        
+        final_price = price_path[-1]
+        if final_price >= self.maturity_barrier:
+            return self.N * (1 + self.C_annual * self.T_total), self.T_rem
+            
+        is_knocked_in = self.has_knocked_in
+        if not is_knocked_in:
+            if np.min(price_path) <= self.B_in:
+                is_knocked_in = True
+        
+        if is_knocked_in:
+            return self.N * min(1.0, final_price / self.S0), self.T_rem
+        else:
+            return self.N * (1 + self.R_annual * self.T_total), self.T_rem
+
+
+    def payoff(self, S_vec: np.ndarray) -> np.ndarray:
+        val_ko = self.N * (1 + self.C_annual * self.T_total)
+        val_dnt = self.N * (1 + self.R_annual * self.T_total)
+        val_ki  = self.N * np.minimum(1.0, S_vec / self.S0)
+        return np.where(S_vec >= self.maturity_barrier, val_ko, 
+                        np.where(S_vec <= self.B_in, val_ki, val_dnt))
+
+    def payoff_shadow(self, S_vec: np.ndarray) -> np.ndarray:
+        val_ko = self.N * (1 + self.C_annual * self.T_total)
+        val_asset = self.N * np.minimum(1.0, S_vec / self.S0)
+        return np.where(S_vec >= self.maturity_barrier, val_ko, val_asset)
+
+    def get_event_dates(self, current_T_rem: float) -> List[float]:
+        events = sorted(list(self.fdm_event_map.keys()))
+        valid_events = [t for t in events if 0 < t <= current_T_rem]
+        return valid_events
+
+    def get_event_handler(self) -> Callable:
+        event_map = self.fdm_event_map
+        coupon = self.C_annual
+        T_total = self.T_total
+        N = self.N
+        
+        def _step_down_handler(V: np.ndarray, S: np.ndarray, t_rem_current: float) -> np.ndarray:
+            key_t = round(t_rem_current, 6)
+            if key_t in event_map:
+                current_barrier = event_map[key_t]
+            else:
+                all_times = np.array(list(event_map.keys()))
+                idx = (np.abs(all_times - t_rem_current)).argmin()
+                closest_t = all_times[idx]
+                current_barrier = event_map[closest_t]
+            
+            knock_out_mask = (S >= current_barrier)
+            elapsed_time = T_total - t_rem_current
+            rebate_val = N * (1 + coupon * elapsed_time)
+            
+            V_new = V.copy()
+            V_new[knock_out_mask] = rebate_val
+            return V_new
+            
+        return _step_down_handler
+
+    def get_boundary_values(self, S_vec: np.ndarray, t_rem: float, r: float) -> Tuple[float, float]:
+        lower_val = self.N * np.minimum(1.0, S_vec[0] / self.S0)
+        upper_val = 0.0
+        
+        current_time_from_start = self.T_total - t_rem
+        
+        next_obs_time = None
+        epsilon = 1e-5 
+        
+        for m in self.obs_dates:
+            t_obs = m / 12.0 
+            if t_obs >= current_time_from_start - epsilon:
+                next_obs_time = t_obs
+                break
+        
+        if next_obs_time is not None:
+            ko_payoff = self.N * (1 + self.C_annual * next_obs_time)
+            dt_discount = next_obs_time - current_time_from_start
+            
+            if dt_discount > 0:
+                upper_val = ko_payoff * np.exp(-r * dt_discount)
+            else:
+                upper_val = ko_payoff
+        else:
+            elapsed = self.T_total - t_rem
+            upper_val = self.N * (1 + self.C_annual * elapsed)
+
+        return lower_val, upper_val
+
+    def get_critical_points(self) -> List[float]:
+        points = [self.B_in]
+        unique_ko_barriers = set(self.ko_barriers_full_schedule)
+        points.extend(unique_ko_barriers)
+        return sorted(list(points))
+
+
+
+
+
+class PhoenixDCN(Instrument):
+    """
+    [Phoenix DCN] 凤凰结构 / 数字票息票据
+    """
+    
+    def __init__(self, initial_price: float, knock_in_barrier: float, coupon_barrier: float,        
+                 obs_dates: List[int], initial_ko_barrier: float, step_down_size: float,         
+                 ko_start_month: int, coupon_rate_annual: float, T_total: float,
+                 dt: float, T_rem: float = None,
+                 ko_floor: float = None):       
+        """
+        Args:
+            coupon_rate_annual: 年化票息率。内部会自动除以12计算单期票息金额。
+            ko_start_month: 从第几个月开始观察敲出。
+            obs_dates: 观察月份列表, 包含所有观察月份，例如 [1, 2, 3, ..., 12]。
+        """
+        self.S0 = initial_price
+        self.B_in = knock_in_barrier
+        self.B_coupon = coupon_barrier
+        self.N = 1.0
+        self.coupon_amount = self.N * coupon_rate_annual / 12.0
+        
+        self.T_total = T_total
+        self.dt = dt
+        self.T_rem = T_total if T_rem is None else T_rem
+        super().__init__(T=self.T_rem)
+        
+        
+        self.ko_schedule_full = [] 
+        self.obs_dates_years = []  
+        
+
+        start_idx = obs_dates.index(ko_start_month)
+
+
+        for i, m in enumerate(obs_dates):
+            t_year = m / 12.0
+            self.obs_dates_years.append(t_year)
+            
+            if m < ko_start_month:
+                barrier = float('inf')
+            else:
+                steps = i - start_idx
+                barrier = initial_ko_barrier - (steps * step_down_size)
+                if ko_floor is not None:
+                    barrier = max(barrier, ko_floor)
+            
+            self.ko_schedule_full.append(barrier)
+
+        current_time_elapsed = self.T_total - self.T_rem
+        
+        self.mc_schedule = []       
+        self.fdm_event_map = {}     
+        self.maturity_barrier = float('inf') 
+        
+        epsilon = 1e-5
+        
+        for t_year, barrier in zip(self.obs_dates_years, self.ko_schedule_full):
+            is_maturity_date = False
+            if abs(t_year - self.T_total) < epsilon:
+                self.maturity_barrier = barrier
+                self.is_maturity_obs = True
+                is_maturity_date = True
+            
+            if t_year > current_time_elapsed + epsilon:
+                t_rem_at_event = self.T_total - t_year
+                self.fdm_event_map[round(t_rem_at_event, 6)] = barrier
+                
+                if not is_maturity_date:
+                    time_from_now = t_year - current_time_elapsed
+                    step_idx = int(round(time_from_now / self.dt))
+                    if step_idx > 0:
+                        self.mc_schedule.append((step_idx, barrier))
+
+    
+    def is_path_dependent(self) -> bool:
+        return True
+
+    def process_one_path(self, price_path: np.ndarray) -> Tuple[float, float]:
+        accumulated_payoff = 0.0
+        
+        for step_idx, ko_barrier in self.mc_schedule:
+            if step_idx < len(price_path):
+                current_S = price_path[step_idx]
+                
+                if current_S >= ko_barrier:
+                    current_payoff = self.N + self.coupon_amount
+                    total_payoff = accumulated_payoff + current_payoff
+                    settlement_time = step_idx * self.dt
+                    return total_payoff, settlement_time
+                
+                if current_S >= self.B_coupon:
+                    accumulated_payoff += self.coupon_amount
+        
+        final_price = price_path[-1]
+        final_settlement_time = self.T_rem
+
+        if self.is_maturity_obs and final_price >= self.B_coupon:
+            final_payoff = self.N + self.coupon_amount
+            return accumulated_payoff + final_payoff, final_settlement_time
+            
+        final_principal = 0.0
+        
+        if final_price >= self.B_in:
+            final_principal = self.N
+        else:
+            final_principal = self.N * (final_price / self.S0)
+            
+        return accumulated_payoff + final_principal, final_settlement_time
+
+
+    def payoff(self, S_vec: np.ndarray) -> np.ndarray:
+        val_ko = self.N + self.coupon_amount
+        val_coupon_alive = self.N + self.coupon_amount
+        val_protect = self.N
+        val_ki = self.N * (S_vec / self.S0)
+        
+        res = np.where(S_vec >= self.B_coupon, 
+                       val_coupon_alive,
+                       np.where(S_vec >= self.B_in, val_protect, val_ki))
+        res = np.where(S_vec >= self.maturity_barrier, val_ko, res)
+        
+        return res
+
+    def get_event_dates(self, current_T_rem: float) -> List[float]:
+        events = sorted(list(self.fdm_event_map.keys()))
+        valid_events = [t for t in events if 0 < t <= current_T_rem]
+        return valid_events
+
+    def get_event_handler(self) -> Callable:
+        event_map = self.fdm_event_map
+        coupon_amt = self.coupon_amount
+        coupon_barrier = self.B_coupon
+        N = self.N
+        
+        def _phoenix_handler(V: np.ndarray, S: np.ndarray, t_rem_current: float) -> np.ndarray:
+            key_t = round(t_rem_current, 6)
+            if key_t in event_map:
+                current_ko_barrier = event_map[key_t]
+            else:
+                all_times = np.array(list(event_map.keys()))
+                idx = (np.abs(all_times - t_rem_current)).argmin()
+                closest_t = all_times[idx]
+                current_ko_barrier = event_map[closest_t]
+            
+            V_new = V.copy()
+            
+            ko_mask = (S >= current_ko_barrier)
+            V_new[ko_mask] = N + coupon_amt
+            
+            alive_mask = ~ko_mask
+            coupon_mask = alive_mask & (S >= coupon_barrier)
+            V_new[coupon_mask] += coupon_amt
+            
+            return V_new
+            
+        return _phoenix_handler
+
+    def get_boundary_values(self, S_vec: np.ndarray, t_rem: float, r: float) -> Tuple[float, float]:
+        lower_val = self.N * (S_vec[0] / self.S0)
+        upper_val = 0.0
+        
+        current_time_from_start = self.T_total - t_rem
+        next_obs_time = None
+        epsilon = 1e-5 
+        
+        for t_obs in self.obs_dates_years:
+            if t_obs >= current_time_from_start - epsilon:
+                next_obs_time = t_obs
+                break
+        
+        target_payoff = self.N + self.coupon_amount
+        
+        if next_obs_time is not None:
+            dt_discount = next_obs_time - current_time_from_start
+            if dt_discount > 0:
+                upper_val = target_payoff * np.exp(-r * dt_discount)
+            else:
+                upper_val = target_payoff
+            
+        return lower_val, upper_val
+
+
+    def get_critical_points(self) -> List[float]:
+        points = {self.B_in, self.B_coupon}
+        for barrier in self.fdm_event_map.values():
+            points.add(barrier)
+        valid_points = [p for p in points if p != float('inf')]
+        return sorted(valid_points)
 
 
 

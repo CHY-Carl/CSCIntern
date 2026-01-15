@@ -55,9 +55,7 @@ def run_hedge_backtest_double_sharkfin(sheet):
         df.columns = ['Date', 'Spot', 'Future', 'Rate'] + list(df.columns[4:])
     df['Date'] = pd.to_datetime(df['Date'])
     
-    S0 = df['Spot'].iloc[0]
-    num_options = notional_amount / S0
-    print(f"Initial Spot: {S0:.2f}, Notional: {notional_amount:,.0f}, Calculated Num Options: {num_options:,.2f}")
+    initial_real_spot = df['Spot'].iloc[0]
 
     # -----------------------------------------------------
     # config setup
@@ -72,7 +70,9 @@ def run_hedge_backtest_double_sharkfin(sheet):
         'Expiry_Date': pd.to_datetime(expiry_date_val),
         
         'initial_cash': float(initial_cash),
-        'num_options': num_options,
+        'notional_amount': float(notional_amount), 
+        'initial_spot': initial_real_spot,  
+        
         'hedge_instrument': hedge_instrument,
         'future_multiplier': 200,
         'fee_rate': fee_rate,

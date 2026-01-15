@@ -7,7 +7,6 @@ from pathlib import Path
 
 sys.path.append('../../')
 
-# 导入业务模块
 from PricingLib.BackTest.BacktestApp import run_backtest_logic
 from PricingLib.Base.Utils import PlotUtils
 
@@ -61,8 +60,7 @@ def run_hedge_backtest_sharkfin(sheet):
         
     df['Date'] = pd.to_datetime(df['Date'])
     
-    S0 = df['Spot'].iloc[0]
-    num_options = notional_amount / S0
+    initial_real_spot = df['Spot'].iloc[0]
 
 
 
@@ -73,7 +71,9 @@ def run_hedge_backtest_sharkfin(sheet):
         'Expiry_Date': pd.to_datetime(expiry_date_val),
         
         'initial_cash': float(initial_cash),
-        'num_options': num_options,       
+        
+        'notional_amount': float(notional_amount), 
+        'initial_spot': initial_real_spot,   
         'hedge_instrument': hedge_instrument,
 
         'future_multiplier': 200,

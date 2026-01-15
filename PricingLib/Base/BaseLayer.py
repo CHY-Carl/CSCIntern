@@ -57,6 +57,13 @@ class Instrument(ABC):
         """是否路径依赖 (决定 MC 是否需要存储完整路径)"""
         pass
 
+    @abstractmethod
+    def get_critical_points(self) -> List[float]:
+        """
+        [新增] 返回需要加密网格的关键价格点 (Strike, Barrier)。
+        """
+        pass
+
     def get_boundary_values(self, S_vec, t_rem, r):
         """
         返回下边界和上边界的价值。

@@ -82,12 +82,18 @@ class UpAndOutCall(Instrument):
         """
         lower = 0.0
 
-        upper = self.rebate * np.exp(-r * t_rem)
+        t_to_maturity = self.T_init - t_rem
+        upper = self.rebate * np.exp(-r * t_to_maturity)
         return lower, upper
+    
+    def get_critical_points(self) -> list:
+        return [self.K, self.H]
     
     @property
     def barrier(self):
         return self.H
+    
+
 
 
 
@@ -196,9 +202,14 @@ class DoubleSharkFin(Instrument):
 
     def get_boundary_values(self, S_vec, t_rem, r):
         """为 FDM 提供双侧 Dirichlet 边界值"""
+        #传入的t_rem实际上是已经过去的时间
+        tau = self.T_init - t_rem
         lower = self.R_L * np.exp(-r * t_rem)
         upper = self.R_U * np.exp(-r * t_rem)
         return lower, upper
+
+    def get_critical_points(self):
+        return [self.K_L, self.K_U, self.H_L, self.H_U]
 
     @property
     def barrier_low(self): 

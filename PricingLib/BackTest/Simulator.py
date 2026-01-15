@@ -57,7 +57,8 @@ class BacktestSimulator:
         # print(f"Starting Simulation ({len(self.data)} steps)...")
         
         expiry_date = self.cfg.get('Expiry_Date')
-        position_size = self.cfg['num_options']
+        notional = self.cfg.get('notional_amount')
+        ref_S0 = self.cfg.get('initial_spot', self.data.iloc[0]['Spot'])
 
         if self.hedge_inst == 'Future':
             hedge_mult = self.cfg.get('future_multiplier', 1.0)
@@ -67,16 +68,22 @@ class BacktestSimulator:
         if isinstance(self.strategy, HedgingStrategy):
             T_0 = DateUtils.year_fraction(self.data.iloc[0]['Date'], expiry_date, 'ACT/365') if expiry_date else 0.0
 
+            # 【修改点】构建初始归一化市场 (S=1.0)
             market_0 = MarketEnvironment(
-                S=self.data.iloc[0]['Spot'],
+                S=1.0,
                 r=self.data.iloc[0]['Rate'],
                 sigma=self.data.iloc[0].get('Vol', self.cfg.get('sigma', 0.2)),
                 T=T_0
             )
 
-            init_opt_price = self.strategy.engine.get_price(self.product, market_0)
-            premium_income = init_opt_price * position_size
-            self.account.deposit(premium_income)
+            # 计算单位权利金 (百分比形式，例如 0.05)
+            init_price_pct = self.strategy.engine.get_price(self.product, market_0)
+            
+            # 计算总权利金收入 (百分比 * 名义本金)
+            total_premium = init_price_pct * notional
+            self.account.deposit(total_premium)
+            
+            # print(f"DEBUG: Initial Sell. Price(%): {init_price_pct:.4f}, Premium: {total_premium:,.2f}")
 
         last_processed_row = None
         # --- 主循环：遍历交易日 ---
@@ -91,7 +98,7 @@ class BacktestSimulator:
                 print(f"DEBUG: Reached Expiry Date {curr_date.date()}. Switching to Settlement.")
                 break
 
-            S = row['Spot']
+            real_S = row['Spot']
             F = row['Future']
             r = row['Rate']
             sigma = row.get('Vol', self.cfg.get('sigma', 0.2))
@@ -110,11 +117,13 @@ class BacktestSimulator:
             # -----------------------------------------------------
             # 1. 市场环境更新 (Update Market)
             # -----------------------------------------------------
+            norm_S = real_S / ref_S0
+
             T_rem = 0.0
             if expiry_date:
                 T_rem = DateUtils.year_fraction(curr_date, expiry_date, 'ACT/365')
             
-            market = MarketEnvironment(S=S, r=r, sigma=sigma, T=T_rem)
+            market = MarketEnvironment(S=norm_S, r=r, sigma=sigma, T=T_rem)
             
             # -----------------------------------------------------
             # 2. 账户计息 (Accrue Interest)
@@ -131,11 +140,11 @@ class BacktestSimulator:
             if T_rem < 0: break
             
             opt_mtm_value = 0.0
-            is_alive = self.product.update_status(S)
+            is_alive = self.product.update_status(norm_S)
 
             if is_alive:
                 if T_rem > 0.002: # 约半个交易日
-                    target_pos, signals_to_log = self.strategy.get_signal(self.product, market, seed=np.random.randint(1e6))
+                    target_pos, signals_to_log = self.strategy.get_signal(self.product, market, current_real_spot=real_S, seed=np.random.randint(1e6))
                 else:
                     # 临近到期，强制平仓归零
                     target_pos = 0.0
@@ -146,15 +155,15 @@ class BacktestSimulator:
                 if T_rem > 0:
                     try:
                         unit_price = self.strategy.engine.get_price(self.product, market)
-                        opt_mtm_value = unit_price * position_size
+                        opt_mtm_value = unit_price * notional
                     except:
                         opt_mtm_value = 0.0
                 
             else:
                 target_pos = 0.0
-                residual_value = self.product.get_residual_value(S, T_rem, r)
-                print(f"DEBUG: Product Inactive on {curr_date.date()}, Residual Value per Unit: {residual_value:.2f}")
-                opt_mtm_value = residual_value * position_size
+                residual_value = self.product.get_residual_value(norm_S, T_rem, r)
+                # print(f"DEBUG: Product Inactive on {curr_date.date()}, Residual Value per Unit: {residual_value:.2f}")
+                opt_mtm_value = residual_value * notional
 
                 if isinstance(self.strategy, DeltaHedgeStrategy):
                     signals_to_log = {'delta': 0.0}
@@ -178,7 +187,7 @@ class BacktestSimulator:
             
             self.account.mark_to_market(
                 date=curr_date,
-                spot=S,
+                spot=real_S,
                 hedge_price=current_hedge_price,
                 option_val=opt_mtm_value, # 卖方视角下，这是负债
                 rate=r,
@@ -200,13 +209,14 @@ class BacktestSimulator:
         
         # 计算期权的最终价值 (Final Payoff)
         final_payout_total = 0.0
+        S_final_norm = S_final / ref_S0
 
         if self.product.is_active:
-            final_unit_payoff = self.product.payoff(S_final)
-            final_payout_total = final_unit_payoff * position_size
+            final_unit_payoff = self.product.payoff(S_final_norm)
+            final_payout_total = final_unit_payoff * notional
         else:
-            final_unit_payoff = self.product.get_residual_value(S_final, 0, r_final)
-            final_payout_total = final_unit_payoff * position_size
+            final_unit_payoff = self.product.get_residual_value(S_final_norm, 0, r_final)
+            final_payout_total = final_unit_payoff * notional
         
         if final_payout_total > 0:
             self.account.cash -= final_payout_total

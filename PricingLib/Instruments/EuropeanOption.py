@@ -49,15 +49,19 @@ class EuropeanOption(Instrument):
         return False 
     
     def get_boundary_values(self, S_vec, t_rem, r):
+        tau = self.T - t_rem
         # S_vec[0] is lower, S_vec[-1] is upper
         if self.option_type == 'call':
             # Lower: S=0 -> 0
             # Upper: S=Smax -> S - K*exp(-rt)
             lower = 0.0
-            upper = S_vec[-1] - self.K * np.exp(-r * t_rem)
+            upper = S_vec[-1] - self.K * np.exp(-r * tau)
         else:
             # Lower: S=0 -> K*exp(-rt)
             # Upper: S=Smax -> 0
-            lower = self.K * np.exp(-r * t_rem)
+            lower = self.K * np.exp(-r * tau)
             upper = 0.0
         return lower, upper
+    
+    def get_critical_points(self) -> list:
+        return [self.K]

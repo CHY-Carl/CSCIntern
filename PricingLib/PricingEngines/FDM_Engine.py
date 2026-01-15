@@ -6,14 +6,14 @@ from PricingLib.Base.Utils import MathUtils, MatrixUtils
 
 from abc import ABC, abstractmethod
 import numpy as np
-from typing import Dict, Any, Union
+from typing import Dict, Any, Union, List
 
 
 
 class FDMCoefficients(ABC):
     """策略接口：只负责计算矩阵系数 a, b, c"""
     @abstractmethod
-    def get_coefficients(self, process: StochasticProcess, dt: float, dS: float, S_vec: np.ndarray):
+    def get_coefficients(self, process: StochasticProcess, dt: float, dS: float, S_vec: np.ndarray, n:Union[int, None]=None):
         """返回 LHS(左边) 和 RHS(右边) 的系数"""
         pass
 
@@ -26,7 +26,8 @@ class CNScheme(FDMCoefficients):
                          market: MarketEnvironment, 
                          dt: float, 
                          dS: float, 
-                         S_vec: np.ndarray) -> tuple[tuple, tuple]:
+                         S_vec: np.ndarray,
+                         n=None) -> tuple[tuple, tuple]:
         """
         根据通用的 PDE 系数计算 Crank-Nicolson 格式的系数向量。
         
@@ -87,7 +88,8 @@ class ImplicitScheme(FDMCoefficients):
                          market: MarketEnvironment, 
                          dt: float, 
                          dS: float, 
-                         S_vec: np.ndarray) -> tuple[tuple, tuple]:
+                         S_vec: np.ndarray,
+                         n=None) -> tuple[tuple, tuple]:
         
         # 1. 从 process 获取内部网格点上的通用 PDE 系数
         inner_S_vec = S_vec[1:-1]
@@ -184,8 +186,8 @@ class FDMEngine(PricingEngine):
         
         V = option.payoff(S_vec) 
         if V.ndim == 1: V = V[:, np.newaxis]
-        
-        for i in range(self.N):
+        #TODO 调整t_rem 的逻辑，现在t_rem 相当于 time_elapsed
+        for i in range(self.N): 
             t_rem = T - (i + 1) * dt
             t_old = t_rem + dt
             
@@ -219,7 +221,8 @@ class FDMEngine(PricingEngine):
         # 如果当前 S 已经在边界外，直接处理（安全保护）
         #TODO 安全保护的向量期权情况处理逻辑
         if market.S <= S_vec[0] or market.S >= S_vec[-1]:
-            bc_l, bc_u = option.get_boundary_values(S_vec, market.T, market.r)
+            #!因为传入的time 是 time_elapsed，所以这里传入0
+            bc_l, bc_u = option.get_boundary_values(S_vec, 0, market.r)
             price = bc_l if market.S <= S_vec[0] else bc_u
         
         if isinstance(price, np.ndarray) and price.size == 1:
@@ -811,7 +814,7 @@ class EventFDMEngine(FDMEngine):
 
         price_up = MathUtils.linear_interp(market.S, S_vec, V_up)
         price_down = MathUtils.linear_interp(market.S, S_vec, V_down)
-        
+
         if abs(d_sigma) < 1e-9:
             return 0.0
             
@@ -851,7 +854,7 @@ class EventFDMEngine(FDMEngine):
             if hasattr(instrument, 'barrier_low') and instrument.barrier_low is not None and market.S < instrument.barrier_low:
                 if hasattr(instrument, 'get_shadow_instrument'):
                     shadow_opt = instrument.get_shadow_instrument()
-                    return self.get_daily_theta_pnl(shadow_opt, market)
+                    return self.get_theta(shadow_opt, market)
                 else:
                     return 0.0
                 
@@ -1055,5 +1058,575 @@ class EventFDMEngine(FDMEngine):
         
         return vanna_val
 
+
+
+
+
+class RannacherScheme(FDMCoefficients):
+    """
+    【最终实现】一个有状态的、带内部缓存的 Scheme。
+    """
+    def __init__(self, damping_steps: int = 4):
+        self.damping_steps = damping_steps
+        # 初始化内部缓存为空
+        self._coeffs_implicit = None
+        self._coeffs_cn = None
+        self._last_state_key = None 
+    
+        self._active_damping_counter = 0
+
+
+    def activate_damping(self):
+        self._active_damping_counter = self.damping_steps
+
+
+    def _precompute_coefficients(self, process, market, dt, S_vec):
+        """
+        私有方法：执行一次性的昂贵计算，并填充缓存。
+        """
+        inner_S_vec = S_vec[1:-1]
+        M = len(inner_S_vec) # M 现在是内部点的数量 (M_orig - 1)
+
+        # 1. 计算非均匀网格的空间算子 L 的系数 (a, b, c)
+        h_L = inner_S_vec - S_vec[:-2]
+        h_R = S_vec[2:] - inner_S_vec
+        
+        alpha_pde, beta_pde, gamma_pde_vec = process.pde_coefficients(market, 0, inner_S_vec)
+        
+        d1_L = -h_R / (h_L * (h_L + h_R)); d1_R = h_L / (h_R * (h_L + h_R))
+        d1_C = (h_R - h_L) / (h_L * h_R)
+        d2_L = 2 / (h_L * (h_L + h_R)); d2_R = 2 / (h_R * (h_L + h_R))
+        d2_C = -(d2_L + d2_R)
+        
+        a_vec = alpha_pde * d2_L + beta_pde * d1_L
+        c_vec = alpha_pde * d2_R + beta_pde * d1_R
+        b_vec = alpha_pde * d2_C + beta_pde * d1_C + gamma_pde_vec
+        
+        # 2. 计算并缓存【全隐式】的系数 (theta=1.0)
+        theta_impl = 1.0
+        l_lhs_impl = -theta_impl * dt * a_vec
+        d_lhs_impl = 1.0 - theta_impl * dt * b_vec
+        u_lhs_impl = -theta_impl * dt * c_vec
+        
+        l_rhs_impl = (1 - theta_impl) * dt * a_vec # 结果为 0
+        d_rhs_impl = 1.0 + (1 - theta_impl) * dt * b_vec # 结果为 1
+        u_rhs_impl = (1 - theta_impl) * dt * c_vec # 结果为 0
+        
+        self._coeffs_implicit = ((l_lhs_impl, d_lhs_impl, u_lhs_impl), 
+                                 (l_rhs_impl, d_rhs_impl, u_rhs_impl))
+        
+        # 3. 计算并缓存【Crank-Nicolson】的系数 (theta=0.5)
+        theta_cn = 0.5
+        l_lhs_cn = -theta_cn * dt * a_vec
+        d_lhs_cn = 1.0 - theta_cn * dt * b_vec
+        u_lhs_cn = -theta_cn * dt * c_vec
+        
+        l_rhs_cn = (1 - theta_cn) * dt * a_vec
+        d_rhs_cn = 1.0 + (1 - theta_cn) * dt * b_vec
+        u_rhs_cn = (1 - theta_cn) * dt * c_vec
+        
+        self._coeffs_cn = ((l_lhs_cn, d_lhs_cn, u_lhs_cn), 
+                           (l_rhs_cn, d_rhs_cn, u_rhs_cn))
+
+    # def get_coefficients(self, 
+    #                      process: StochasticProcess, 
+    #                      market: MarketEnvironment,
+    #                      dt: float, 
+    #                      S_vec: np.ndarray, 
+    #                      n: int) -> tuple[tuple, tuple]:
+        
+    #     current_grid_hash = hash(S_vec.tobytes())
+        
+    #     # 如果缓存为空，或者当前网格的哈希与上次不符，则重新计算
+    #     if self._coeffs_implicit is None or current_grid_hash != self._last_grid_hash:
+    #         self._precompute_coefficients(process, market, dt, S_vec)
+    #         # 更新哈希值，以便下次比较
+    #         self._last_grid_hash = current_grid_hash
+        
+    #     # 【方法切换】根据时间步 n，返回对应的缓存结果
+    #     if n < self.damping_steps:
+    #         return self._coeffs_implicit
+    #     else:
+    #         return self._coeffs_cn
+
+
+    def get_coefficients(self, process, market, dt, S_vec, n: int) -> tuple[tuple, tuple]:
+        # 1. 缓存检查
+        current_state_key = (
+            hash(S_vec.tobytes()),  # 空间结构
+            market.sigma,           # 波动率 (影响 Vega)
+            market.r,               # 利率 (影响 Rho)
+            dt                      # 时间步长
+        )
+        if self._coeffs_implicit is None or current_state_key != self._last_state_key:
+            self._precompute_coefficients(process, market, dt, S_vec)
+            self._last_grid_hash = current_state_key
+            # 每次网格重置时，也可以选择重置阻尼，或者让它自然衰减
+            # 这里我们不重置 _active_damping_counter，因为它属于时间步进逻辑
+        
+        # 2. 【修改点】判断是否使用全隐式
+        # 条件 A: 初始几步 (n < 4)
+        # 条件 B: 阻尼器处于激活状态 (counter > 0)
+        use_implicit = (n < self.damping_steps) or (self._active_damping_counter > 0)
+        #! 设置为负数时，禁用动态阻尼功能
+        if self.damping_steps < 0:
+            use_implicit = False
+        
+        # 如果使用了动态阻尼，计数器减 1
+        if self._active_damping_counter > 0:
+            self._active_damping_counter -= 1
+            
+        if use_implicit:
+            return self._coeffs_implicit
+        else:
+            return self._coeffs_cn
+
+
+
+
+
+class FDMEnginePro(FDMEngine):
+    """
+    高级有限差分引擎，继承自 FDMEngine，并实现：
+    1. 非均匀网格 (Non-uniform Grid)，在关键点自动加密。
+    2. Rannacher 平滑启动，消除数值震荡。
+    3. 修正了在非均匀网格下的 Greeks 计算。
+    """
+    def __init__(self, 
+                 process: StochasticProcess, 
+                 N_time: int = 252,
+                 M_base: int = 150,
+                 density_range: float = 0.02,
+                 step_size: float = 0.0005,
+                 damping_steps: int = 4):
+        
+        super().__init__(process, M_space=M_base, N_time=N_time)
+        self.M_base = int(M_base)
+        self.density_range = density_range
+        self.step_size = step_size
+        
+        self.scheme = RannacherScheme(damping_steps=damping_steps)
+
+    def _generate_non_uniform_grid(self, S_min: float, S_max: float, critical_points: List[float]) -> np.ndarray:
+        grids_to_merge = []
+        
+        base_grid = np.linspace(S_min, S_max, self.M_base)
+        grids_to_merge.append(base_grid)
+        
+        if critical_points:
+            valid_cps = [cp for cp in critical_points if S_min < cp < S_max]
+            
+            if valid_cps:
+                grids_to_merge.append(np.array(valid_cps))
+                for cp in valid_cps:
+                    start = max(S_min, cp * (1 - self.density_range))
+                    end = min(S_max, cp * (1 + self.density_range))
+                    
+                    if start < end:
+                        local_grid = np.arange(start, end, self.step_size)
+                        grids_to_merge.append(local_grid)
+        
+        if not grids_to_merge:
+            return np.array([S_min, S_max]) 
+            
+        grid = np.concatenate(grids_to_merge)
+        grid = np.sort(grid)
+        grid = np.unique(grid)
+        
+        epsilon = 1e-6 
+        
+        if len(grid) > 1:
+            dx = np.diff(grid)
+            mask = np.concatenate(([True], dx > epsilon))
+            
+            grid = grid[mask]
+        return grid
+
+    def _generate_grid(self, option: Instrument, market: MarketEnvironment):
+        S, T, r, sigma = market.S, market.T, market.r, market.sigma
+        S_min, S_max = 0.0, 0.0
+        
+        # 场景 1: 双边障碍
+        if hasattr(option, 'barrier_high') and hasattr(option, 'barrier_low'):
+            S_min = option.barrier_low
+            S_max = option.barrier_high
+        # 场景 2: 单边上障碍
+        elif hasattr(option, 'barrier'): # 假设 'barrier' 默认为上障碍
+            S_min = 0.0
+            S_max = option.barrier
+        # 场景 3: 单边下障碍
+        elif hasattr(option, 'barrier_low'):
+            S_min = option.barrier_low
+            #!5.0是一个超参数
+            S_max = S * np.exp((r - 0.5 * sigma**2) * T + 5.0 * sigma * np.sqrt(T))
+        # 场景 4: 无障碍
+        else:
+            S_min = 0.0
+            S_stat_max = S * np.exp((r - 0.5 * sigma**2) * T + 5.0 * sigma * np.sqrt(T))
+            S_max = S_stat_max
+            critical_points = option.get_critical_points()
+            if critical_points:
+                S_max = max(S_max, max(critical_points) * 1.5)
+
+        S_vec = self._generate_non_uniform_grid(S_min, S_max, option.get_critical_points())
+        dt = T / self.N
+        
+        return S_vec, dt
+
+    def _solve_on_grid(self, option: Instrument, market: MarketEnvironment, S_vec: np.ndarray, dt: float):
+        V = option.payoff(S_vec) 
+        if V.ndim == 1: V = V[:, np.newaxis]
+        
+        for i in range(self.N): 
+            (l_lhs, d_lhs, u_lhs), (l_rhs, d_rhs, u_rhs) = self.scheme.get_coefficients(
+                self.process, market, dt, S_vec, n=i
+            )
+            
+            t_rem = market.T - (i + 1) * dt
+            
+            bc_l_old, bc_u_old = option.get_boundary_values(S_vec, t_rem + dt, market.r)
+            V[0, :] = bc_l_old; V[-1, :] = bc_u_old
+            
+            rhs_vec = l_rhs[:, None] * V[:-2, :] + d_rhs[:, None] * V[1:-1, :] + u_rhs[:, None] * V[2:, :]
+            
+            bc_l_new, bc_u_new = option.get_boundary_values(S_vec, t_rem, market.r)
+            rhs_vec[0, :] -= l_lhs[0] * bc_l_new
+            rhs_vec[-1, :] -= u_lhs[-1] * bc_u_new
+            
+            # 假设 MatrixUtils.solve_tridiagonal 存在
+            V[1:-1, :] = MatrixUtils.solve_tridiagonal(u_lhs, d_lhs, l_lhs, rhs_vec)
+            
+        bc_l, bc_u = option.get_boundary_values(S_vec, 0, market.r)
+        V[0, :] = bc_l; V[-1, :] = bc_u
+        return V
+
+    # --- 重构 Greeks 计算以支持非均匀网格 ---
+    
+    def get_delta(self, option, market, **kwargs):
+        S_vec, dt = self._generate_grid(option, market)
+        if hasattr(option, 'barrier_high') and market.S >= option.barrier_high:
+            return 0.0
+        if hasattr(option, 'barrier_low') and market.S <= option.barrier_low:
+            return 0.0
+        if hasattr(option, 'barrier') and market.S >= option.barrier: 
+            return 0.0
+        if hasattr(option, 'ko_barrier') and market.S >= option.ko_barrier:
+            return 0.0
+        
+        V = self._solve_on_grid(option, market, S_vec, dt)
+        
+        # 【核心修正】np.gradient 必须传入非均匀的坐标轴 S_vec
+        D_grid = np.gradient(V, S_vec, axis=0, edge_order=2)
+        delta_val = MathUtils.linear_interp(market.S, S_vec, D_grid)
+        return delta_val.item() if hasattr(delta_val, 'item') else delta_val
+
+    def get_gamma(self, option, market, **kwargs):
+        S_vec, dt = self._generate_grid(option, market)
+        if hasattr(option, 'barrier_high') and market.S >= option.barrier_high:
+            return 0.0
+        if hasattr(option, 'barrier_low') and market.S <= option.barrier_low:
+            return 0.0
+        if hasattr(option, 'barrier') and market.S >= option.barrier: 
+            return 0.0
+        if hasattr(option, 'ko_barrier') and market.S >= option.ko_barrier:
+            return 0.0
+        
+        V = self._solve_on_grid(option, market, S_vec, dt)
+        
+        # 【核心修正】连续两次调用 gradient，每次都传入 S_vec
+        D_grid = np.gradient(V, S_vec, axis=0, edge_order=2)
+        G_grid = np.gradient(D_grid, S_vec, axis=0, edge_order=2)
+        gamma_val = MathUtils.linear_interp(market.S, S_vec, G_grid)
+        return gamma_val.item() if hasattr(gamma_val, 'item') else gamma_val
+
+    def get_vanna(self, option, market, **kwargs):
+        S_vec, dt = self._generate_grid(option, market)
+        if hasattr(option, 'barrier_high') and market.S >= option.barrier_high:
+            return 0.0
+        if hasattr(option, 'barrier_low') and market.S <= option.barrier_low:
+            return 0.0
+        if hasattr(option, 'barrier') and market.S >= option.barrier: 
+            return 0.0
+        if hasattr(option, 'ko_barrier') and market.S >= option.ko_barrier:
+            return 0.0
+        
+        dVol = 0.01
+        m_up = market.clone(sigma=market.sigma + dVol)
+        m_dn = market.clone(sigma=market.sigma - dVol)
+        
+        V_up = self._solve_on_grid(option, m_up, S_vec, dt)
+        V_dn = self._solve_on_grid(option, m_dn, S_vec, dt)
+        D_up = np.gradient(V_up, S_vec, axis=0, edge_order=2)
+        D_dn = np.gradient(V_dn, S_vec, axis=0, edge_order=2)
+        
+        d_up_val = MathUtils.linear_interp(market.S, S_vec, D_up)
+        d_dn_val = MathUtils.linear_interp(market.S, S_vec, D_dn)
+        
+        vanna_val = (d_up_val - d_dn_val) / 2
+        return vanna_val.item() if hasattr(vanna_val, 'item') else vanna_val
+
+
+
+
+
+
+
+class EventFDMEnginePro(EventFDMEngine):
+    """
+    事件驱动的高级 FDM 引擎 (Pro版)。
+    """
+    def __init__(self, 
+                 process: StochasticProcess, 
+                 N_time: int = 252,
+                 M_base: int = 150,
+                 density_range: float = 0.02,
+                 step_size: float = 0.0005,
+                 damping_steps: int = 4):
+        
+        super().__init__(process, M_space=M_base, N_time=N_time)
+        
+        self.M_base = int(M_base)
+        self.density_range = density_range
+        self.step_size = step_size
+        
+        self.scheme = RannacherScheme(damping_steps=damping_steps)
+
+
+    def _generate_non_uniform_grid(self, S_min: float, S_max: float, critical_points: List[float]) -> np.ndarray:
+        grids_to_merge = []
+        
+        base_grid = np.linspace(S_min, S_max, self.M_base)
+        grids_to_merge.append(base_grid)
+        
+        if critical_points:
+            valid_cps = [cp for cp in critical_points if S_min < cp < S_max]
+            
+            if valid_cps:
+                grids_to_merge.append(np.array(valid_cps))
+                for cp in valid_cps:
+                    start = max(S_min, cp * (1 - self.density_range))
+                    end = min(S_max, cp * (1 + self.density_range))
+                    
+                    if start < end:
+                        local_grid = np.arange(start, end, self.step_size)
+                        grids_to_merge.append(local_grid)
+        
+        if not grids_to_merge:
+            return np.array([S_min, S_max]) 
+            
+        grid = np.concatenate(grids_to_merge)
+        grid = np.sort(grid)
+        grid = np.unique(grid)
+        
+        epsilon = 1e-6 
+        
+        if len(grid) > 1:
+            dx = np.diff(grid)
+            mask = np.concatenate(([True], dx > epsilon))
+            
+            grid = grid[mask]
+        return grid
+
+    def _generate_grid(self, option: Instrument, market: MarketEnvironment):
+        S, T, r, sigma = market.S, market.T, market.r, market.sigma
+        S_min, S_max = 0.0, 0.0
+        
+        if hasattr(option, 'barrier_high') and hasattr(option, 'barrier_low'):
+            S_min = option.barrier_low
+            S_max = option.barrier_high
+        elif hasattr(option, 'barrier'): 
+            S_min = 0.0
+            S_max = option.barrier
+        elif hasattr(option, 'barrier_low'):
+            S_min = option.barrier_low
+            S_max = S * np.exp((r - 0.5 * sigma**2) * T + 5.0 * sigma * np.sqrt(T))
+        else:
+            S_min = 0.0
+            S_stat_max = S * np.exp((r - 0.5 * sigma**2) * T + 5.0 * sigma * np.sqrt(T))
+            S_max = S_stat_max
+            critical_points = option.get_critical_points()
+            if critical_points:
+                S_max = max(S_max, max(critical_points) * 1.5)
+
+        S_vec = self._generate_non_uniform_grid(S_min, S_max, option.get_critical_points())
+        dt = T / self.N
+        return S_vec, dt
+
+    def _solve_on_grid(self, option: Instrument, market: MarketEnvironment, S_vec: np.ndarray, dt: float, is_unified_model: bool = False) -> np.ndarray:
+        S, T = market.S, market.T
+        
+        event_dates_rem = option.get_event_dates(T)
+        event_handler = option.get_event_handler()
+        
+        V = option.payoff(S_vec)
+        if V.ndim == 1: V = V[:, np.newaxis]
+
+        V_shadow = None
+        if is_unified_model and hasattr(option, 'payoff_shadow'):
+            V_shadow = option.payoff_shadow(S_vec)
+            if V_shadow.ndim == 1: V_shadow = V_shadow[:, np.newaxis]
+
+        if hasattr(option, 'set_market_environment'):
+            option.set_market_environment(market)
+            
+        epsilon = 1e-9
+
+        for i in range(self.N):
+            tau_old = i * dt
+            tau_new = (i + 1) * dt
+            
+            (l_lhs, d_lhs, u_lhs), (l_rhs, d_rhs, u_rhs) = self.scheme.get_coefficients(
+                self.process, market, dt, S_vec, n=i
+            )
+            
+            rhs_vec = l_rhs[:, None] * V[:-2, :] + \
+                      d_rhs[:, None] * V[1:-1, :] + \
+                      u_rhs[:, None] * V[2:, :]
+            
+            if is_unified_model:
+                rhs_shadow = l_rhs[:, None] * V_shadow[:-2, :] + \
+                             d_rhs[:, None] * V_shadow[1:-1, :] + \
+                             u_rhs[:, None] * V_shadow[2:, :]
+            
+            bc_l, bc_u = option.get_boundary_values(S_vec, tau_new, market.r)
+            
+            rhs_vec[0, :] -= l_lhs[0] * bc_l
+            rhs_vec[-1, :] -= u_lhs[-1] * bc_u
+            
+            if is_unified_model:
+                rhs_shadow[0, :] -= l_lhs[0] * bc_l
+                rhs_shadow[-1, :] -= u_lhs[-1] * bc_u
+            
+            V[1:-1, :] = MatrixUtils.solve_tridiagonal(u_lhs, d_lhs, l_lhs, rhs_vec)
+            if is_unified_model:
+                V_shadow[1:-1, :] = MatrixUtils.solve_tridiagonal(u_lhs, d_lhs, l_lhs, rhs_shadow)
+            
+            V[0, :] = bc_l; V[-1, :] = bc_u
+            if is_unified_model:
+                V_shadow[0, :] = bc_l; V_shadow[-1, :] = bc_u
+
+            if is_unified_model and hasattr(option, 'B_in'):
+                ki_mask = S_vec <= option.B_in
+                V[ki_mask] = V_shadow[ki_mask]
+
+            triggered_events = [t for t in event_dates_rem if tau_old + epsilon < t <= tau_new + epsilon]
+            
+            if triggered_events:
+                event_rem_time = triggered_events[0]
+                V_1d = V.flatten()
+                V_modified_1d = event_handler(V_1d, S_vec, event_rem_time)
+                V = V_modified_1d.reshape(V.shape)
+                
+                if is_unified_model:
+                    V_shadow_1d = V_shadow.flatten()
+                    V_shadow_modified_1d = event_handler(V_shadow_1d, S_vec, event_rem_time)
+                    V_shadow = V_shadow_modified_1d.reshape(V_shadow.shape)
+                
+                self.scheme.activate_damping()
+
+        return V.flatten()
+    
+    def _get_delta_from_grid(self, instrument: Instrument, market: MarketEnvironment) -> float:
+        """
+        基于非均匀网格的 Delta 计算
+        """
+        is_unified_model = hasattr(instrument, 'payoff_shadow')
+
+        if hasattr(instrument, 'check_immediate_termination'):
+            is_terminated, _ = instrument.check_immediate_termination(market.S, market.T)
+            if is_terminated:
+                return 0.0
+            
+        if not is_unified_model:
+            if hasattr(instrument, 'barrier_low') and instrument.barrier_low is not None and market.S < instrument.barrier_low:
+                if hasattr(instrument, 'get_shadow_instrument'):
+                    shadow_opt = instrument.get_shadow_instrument()
+                    return self.get_delta(shadow_opt, market) 
+                else:
+                    return 0.0
+        
+        S_vec, dt = self._generate_grid(instrument, market)
+    
+        if market.S < S_vec[0] or market.S > S_vec[-1]:
+            return 0.0
+
+        V = self._solve_on_grid(instrument, market, S_vec, dt, is_unified_model)
+        D_grid = np.gradient(V, S_vec, axis=0, edge_order=2)
+        
+        delta_val = MathUtils.linear_interp(market.S, S_vec, D_grid)
+
+        if isinstance(delta_val, np.ndarray) and delta_val.size == 1:
+            return delta_val.item() 
+        
+        return delta_val
+
+    def _get_gamma_from_grid(self, instrument: Instrument, market: MarketEnvironment) -> float:
+        """
+        基于非均匀网格的 Gamma 计算
+        """
+        is_unified_model = hasattr(instrument, 'payoff_shadow')
+
+        if hasattr(instrument, 'check_immediate_termination'):
+            is_terminated, _ = instrument.check_immediate_termination(market.S, market.T)
+            if is_terminated: return 0.0
+            
+        if not is_unified_model:
+            if hasattr(instrument, 'barrier_low') and instrument.barrier_low is not None and market.S < instrument.barrier_low:
+                if hasattr(instrument, 'get_shadow_instrument'):
+                    shadow_opt = instrument.get_shadow_instrument()
+                    return self.get_gamma(shadow_opt, market)
+                else:
+                    return 0.0
+        
+        S_vec, dt = self._generate_grid(instrument, market)
+    
+        if market.S < S_vec[0] or market.S > S_vec[-1]:
+            return 0.0
+
+        V = self._solve_on_grid(instrument, market, S_vec, dt, is_unified_model)
+    
+        D_grid = np.gradient(V, S_vec, axis=0, edge_order=2)
+        G_grid = np.gradient(D_grid, S_vec, axis=0, edge_order=2)
+        
+        gamma_val = MathUtils.linear_interp(market.S, S_vec, G_grid)
+
+        if isinstance(gamma_val, np.ndarray) and gamma_val.size == 1:
+            return gamma_val.item() 
+        
+        return gamma_val
+
+
+    def _get_vanna_from_grid(self, instrument: Instrument, market: MarketEnvironment, d_sigma: float) -> float:
+        is_unified_model = hasattr(instrument, 'payoff_shadow')
+
+        if hasattr(instrument, 'check_immediate_termination'):
+            is_terminated, _ = instrument.check_immediate_termination(market.S, market.T)
+            if is_terminated:
+                return 0.0
+        if not is_unified_model:
+            if hasattr(instrument, 'barrier_low') and instrument.barrier_low is not None and market.S < instrument.barrier_low:
+                if hasattr(instrument, 'get_shadow_instrument'):
+                    shadow_opt = instrument.get_shadow_instrument()
+                    return self.get_vanna(shadow_opt, market)
+                else:
+                    return 0.0
+                
+        S_vec, dt = self._generate_grid(instrument, market)
+        
+        dVol = 0.01
+        m_up = market.clone(sigma=market.sigma + dVol)
+        m_dn = market.clone(sigma=market.sigma - dVol)
+        V_up = self._solve_on_grid(instrument, m_up, S_vec, dt, is_unified_model)
+        V_dn = self._solve_on_grid(instrument, m_dn, S_vec, dt, is_unified_model)
+        D_up = np.gradient(V_up, S_vec, axis=0, edge_order=2)
+        D_dn = np.gradient(V_dn, S_vec, axis=0, edge_order=2)
+        d_up_val = MathUtils.linear_interp(market.S, S_vec, D_up)
+        d_dn_val = MathUtils.linear_interp(market.S, S_vec, D_dn)
+        vanna_val = (d_up_val - d_dn_val) / 2
+
+        if isinstance(vanna_val, np.ndarray) and vanna_val.size == 1:
+            return vanna_val.item()
+        
+        return vanna_val
 
 

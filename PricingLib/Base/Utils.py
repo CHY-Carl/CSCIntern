@@ -281,6 +281,7 @@ class DateUtils:
 
 import matplotlib.pyplot as plt
 import seaborn as sns
+import matplotlib.ticker as mtick
 
 class PlotUtils:
     """
@@ -354,3 +355,6 @@ class PlotUtils:
             return None # 或者返回 fig
         else:
             return fig
+
+
+

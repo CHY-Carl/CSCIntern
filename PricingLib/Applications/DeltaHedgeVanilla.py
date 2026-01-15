@@ -52,17 +52,19 @@ def run_hedge_backtest_vanilla(sheet):
         df.columns = ['Date', 'Spot', 'Future', 'Rate'] + list(df.columns[4:])
         
     df['Date'] = pd.to_datetime(df['Date'])
-    
-    S0 = df['Spot'].iloc[0]
-    num_options = notional_amount / S0
 
-    config = {
-        'K': float(K),
-        'Expiry_Date': pd.to_datetime(expiry_date_val), 
+
+    initial_real_spot = df['Spot'].iloc[0]
     
+    # 3. 准备 Config
+    config = {
+        'K': K, 
+        'Expiry_Date': pd.to_datetime(expiry_date_val),
         'initial_cash': float(initial_cash),
         'future_multiplier': 200,
-        'num_options': num_options, 
+        'notional_amount': float(notional_amount), 
+        'initial_spot': initial_real_spot,
+
         'hedge_instrument': hedge_instrument, 
         'fee_rate': fee_rate,
         'threshold': threshold, 

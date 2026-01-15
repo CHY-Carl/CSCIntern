@@ -52,7 +52,7 @@ def run_backtest_logic(market_data_df, config, strategy_type='delta_hedge', opti
     if strategy_type == 'delta_hedge':
         strategy = DeltaHedgeStrategy(
             engine=engine,
-            num_options=config['num_options'],
+            notional_amount=config['notional_amount'],
             hedge_instrument=hedge_inst,
             future_multiplier=config.get('future_multiplier', 1),
             threshold=config.get('threshold', 0.0)

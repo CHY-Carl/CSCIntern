@@ -1,8 +1,6 @@
 import sys
 sys.path.append('../../')
 
-
-# --- 导入您项目中的核心类 ---
 from PricingLib.Instruments.SnowBallOption import SnowballOption, UnifiedSnowball
 from PricingLib.PricingEngines.MC_Engine import MonteCarloEngine
 from PricingLib.PricingEngines.FDM_Engine import FDMEngine, EventFDMEngine
@@ -24,8 +22,8 @@ def calculate_snowball_fdm(S0, r, sigma, T_total, knock_out_pct, knock_in_pct, c
     
     if T_rem is None:
         T_rem = T_total
-    B_out = S0 * knock_out_pct
-    B_in = S0 * knock_in_pct 
+    B_out = knock_out_pct
+    B_in = knock_in_pct 
     
     obs_months = list(range(start_month, int(T_total * 12) + 1))
 
@@ -77,16 +75,13 @@ def run_snowball(sheet: xw.Sheet):
     
     start_month = 3 
     end_month = int(T * 12)
-    # MC 使用的是时间步索引列表
+
     knock_out_indices = [int(round(m * days_per_month)) for m in range(start_month, end_month + 1) if int(round(m * days_per_month)) <= num_steps]
 
-    # =================================================================
-    # MC 
-    # =================================================================
     snowball_product_mc = SnowballOption(
         S0=S0,
-        knock_out_barrier=S0 * knock_out_pct,
-        knock_in_barrier=S0 * knock_in_pct,
+        knock_out_barrier=knock_out_pct,
+        knock_in_barrier=knock_in_pct,
         coupon_rate=coupon_rate,
         rebate_rate=rebate_rate,
         T_total=T,
@@ -117,9 +112,6 @@ def run_snowball(sheet: xw.Sheet):
 
     mc_greeks = get_all_greeks_mc(mc_engine, snowball_product_mc, market)
 
-    # =================================================================
-    #  FDM 计算 
-    # =================================================================
     fdm_price, fdm_greeks = calculate_snowball_fdm(
         S0=S0, r=r, sigma=sigma, T_total=T, 
         knock_out_pct=knock_out_pct, knock_in_pct=knock_in_pct, 
@@ -127,7 +119,7 @@ def run_snowball(sheet: xw.Sheet):
         T_rem=T, start_month=start_month
     )
 
-    # =================================================================
+
     price_rows = [mc_price, fdm_price]
     greek_rows = []
     
